@@ -2,12 +2,71 @@
 /* Copyright(c) 2013 - 2018 Intel Corporation. */
 
 #include <linux/bitfield.h>
+#include <linux/bpf_trace.h>
+#include <linux/filter.h>
 #include <linux/net/intel/libie/rx.h>
 #include <linux/prefetch.h>
+#include <kunit/visibility.h>
 
 #include "iavf.h"
 #include "iavf_trace.h"
 #include "iavf_prototype.h"
+
+/**
+ * iavf_run_xdp - run an XDP program on a received frame
+ * @rx_ring: Rx ring the frame was received on
+ * @xdp_prog: program to run (caller already dereferenced under RCU)
+ * @xdp: xdp_buff wrapping the frame's page (built by the caller)
+ *
+ * DROP/PASS only: no dedicated XDP Tx ring, no ndo_xdp_xmit(), so
+ * XDP_TX/XDP_REDIRECT are treated like any other invalid action.
+ *
+ * Return: the XDP verdict (XDP_PASS or XDP_DROP only).
+ **/
+VISIBLE_IF_KUNIT u32 iavf_run_xdp(struct iavf_ring *rx_ring,
+				  struct bpf_prog *xdp_prog,
+				  struct xdp_buff *xdp)
+{
+	u32 act = bpf_prog_run_xdp(xdp_prog, xdp);
+
+	switch (act) {
+	case XDP_PASS:
+	case XDP_DROP:
+		return act;
+	default:
+		bpf_warn_invalid_xdp_action(rx_ring->netdev, xdp_prog, act);
+		fallthrough;
+	case XDP_ABORTED:
+		trace_xdp_exception(rx_ring->netdev, xdp_prog, act);
+		return XDP_DROP;
+	}
+}
+EXPORT_SYMBOL_IF_KUNIT(iavf_run_xdp);
+
+/**
+ * iavf_xdp_build_skb - build an skb from the (possibly modified) xdp_buff
+ * @xdp: buffer after the program ran with XDP_PASS
+ *
+ * Uses the xdp_buff pointers rather than the original Rx buffer so that
+ * bpf_xdp_adjust_head()/_tail()/_meta() results reach the stack.
+ */
+VISIBLE_IF_KUNIT struct sk_buff *iavf_xdp_build_skb(const struct xdp_buff *xdp)
+{
+	struct sk_buff *skb;
+
+	skb = napi_build_skb(xdp->data_hard_start, xdp->frame_sz);
+	if (unlikely(!skb))
+		return NULL;
+
+	skb_mark_for_recycle(skb);
+	skb_reserve(skb, xdp->data - xdp->data_hard_start);
+	__skb_put(skb, xdp->data_end - xdp->data);
+	if (xdp->data_meta != xdp->data)
+		skb_metadata_set(skb, xdp->data - xdp->data_meta);
+
+	return skb;
+}
+EXPORT_SYMBOL_IF_KUNIT(iavf_xdp_build_skb);
 
 static __le64 build_ctob(u32 td_cmd, u32 td_offset, unsigned int size,
 			 u32 td_tag)
@@ -698,8 +757,7 @@ static void iavf_clean_rx_ring(struct iavf_ring *rx_ring)
 		dev_kfree_skb(rx_ring->skb);
 		rx_ring->skb = NULL;
 	}
-
-	/* Free all the Rx ring buffers */
+	rx_ring->xdp_discard = false;
 	for (u32 i = rx_ring->next_to_clean; i != rx_ring->next_to_use; ) {
 		const struct libeth_fqe *rx_fqes = &rx_ring->rx_fqes[i];
 
@@ -728,6 +786,9 @@ void iavf_free_rx_resources(struct iavf_ring *rx_ring)
 
 	iavf_clean_rx_ring(rx_ring);
 
+	if (xdp_rxq_info_is_reg(&rx_ring->xdp_rxq))
+		xdp_rxq_info_unreg(&rx_ring->xdp_rxq);
+
 	if (rx_ring->desc) {
 		dma_free_coherent(rx_ring->pp->p.dev, rx_ring->size,
 				  rx_ring->desc, rx_ring->dma);
@@ -738,6 +799,7 @@ void iavf_free_rx_resources(struct iavf_ring *rx_ring)
 	rx_ring->rx_fqes = NULL;
 	rx_ring->pp = NULL;
 }
+EXPORT_SYMBOL_IF_KUNIT(iavf_free_rx_resources);
 
 /**
  * iavf_setup_rx_descriptors - Allocate Rx descriptors
@@ -747,6 +809,8 @@ void iavf_free_rx_resources(struct iavf_ring *rx_ring)
  **/
 int iavf_setup_rx_descriptors(struct iavf_ring *rx_ring)
 {
+	struct iavf_adapter *adapter = rx_ring->vsi->back;
+	struct bpf_prog *xdp_prog;
 	struct libeth_fq fq = {
 		.count		= rx_ring->count,
 		.buf_len	= LIBIE_MAX_RX_BUF_LEN,
@@ -754,14 +818,42 @@ int iavf_setup_rx_descriptors(struct iavf_ring *rx_ring)
 	};
 	int ret;
 
-	ret = libeth_rx_fq_create(&fq, &rx_ring->q_vector->napi);
+	/* Runs under adapter->crit_lock (iavf_open()/iavf_reset_task()). */
+	xdp_prog = rcu_dereference_protected(adapter->xdp_prog,
+					     lockdep_is_held(&adapter->crit_lock));
+	fq.xdp = !!xdp_prog;
+
+	ret = xdp_rxq_info_reg(&rx_ring->xdp_rxq, rx_ring->netdev,
+			       rx_ring->queue_index,
+			       rx_ring->q_vector->napi.napi_id);
 	if (ret)
 		return ret;
+
+	ret = libeth_rx_fq_create(&fq, &rx_ring->q_vector->napi);
+	if (ret) {
+		xdp_rxq_info_unreg(&rx_ring->xdp_rxq);
+		return ret;
+	}
+
+	ret = xdp_rxq_info_reg_mem_model(&rx_ring->xdp_rxq, MEM_TYPE_PAGE_POOL,
+					 fq.pp);
+	if (ret) {
+		libeth_rx_fq_destroy(&fq);
+		xdp_rxq_info_unreg(&rx_ring->xdp_rxq);
+		return ret;
+	}
 
 	rx_ring->pp = fq.pp;
 	rx_ring->rx_fqes = fq.fqes;
 	rx_ring->truesize = fq.truesize;
 	rx_ring->rx_buf_len = fq.buf_len;
+
+	/* Pick up whatever program is currently attached at the adapter
+	 * level. Rings are torn down and rebuilt on every reset, so this
+	 * is the point where a program attached before a reset gets
+	 * re-applied.
+	 */
+	rcu_assign_pointer(rx_ring->xdp_prog, xdp_prog);
 
 	u64_stats_init(&rx_ring->syncp);
 
@@ -786,9 +878,11 @@ err:
 	libeth_rx_fq_destroy(&fq);
 	rx_ring->rx_fqes = NULL;
 	rx_ring->pp = NULL;
+	xdp_rxq_info_unreg(&rx_ring->xdp_rxq);
 
 	return -ENOMEM;
 }
+EXPORT_SYMBOL_IF_KUNIT(iavf_setup_rx_descriptors);
 
 /**
  * iavf_release_rx_desc - Store the new tail and head values
@@ -894,6 +988,7 @@ no_buffers:
 	 */
 	return true;
 }
+EXPORT_SYMBOL_IF_KUNIT(iavf_alloc_rx_buffers);
 
 /**
  * iavf_rx_checksum - Indicate in skb if hw indicated a good cksum
@@ -1134,7 +1229,7 @@ static bool iavf_is_non_eop(struct iavf_ring *rx_ring,
  *
  * Returns amount of work completed
  **/
-static int iavf_clean_rx_irq(struct iavf_ring *rx_ring, int budget)
+VISIBLE_IF_KUNIT int iavf_clean_rx_irq(struct iavf_ring *rx_ring, int budget)
 {
 	unsigned int total_rx_bytes = 0, total_rx_packets = 0;
 	struct sk_buff *skb = rx_ring->skb;
@@ -1144,6 +1239,7 @@ static int iavf_clean_rx_irq(struct iavf_ring *rx_ring, int budget)
 	while (likely(total_rx_packets < (unsigned int)budget)) {
 		struct libeth_fqe *rx_buffer;
 		union iavf_rx_desc *rx_desc;
+		struct bpf_prog *xdp_prog;
 		unsigned int size;
 		u16 vlan_tag = 0;
 		u8 rx_ptype;
@@ -1182,6 +1278,55 @@ static int iavf_clean_rx_irq(struct iavf_ring *rx_ring, int budget)
 		if (!libeth_rx_sync_for_cpu(rx_buffer, size))
 			goto skip_data;
 
+		/* While a program is attached max_pkt_size is clamped to one
+		 * buffer, so every frame is a single EOP descriptor; anything
+		 * else is dropped up to its EOP rather than fed to the program.
+		 */
+		rcu_read_lock();
+		xdp_prog = skb ? NULL : rcu_dereference(rx_ring->xdp_prog);
+		if (xdp_prog) {
+			bool eop = iavf_test_staterr(rx_desc, IAVF_RXD_EOF);
+			u32 act = XDP_DROP;
+			struct xdp_buff xdp;
+			bool rx_err;
+			u32 hr;
+
+			rx_err = iavf_test_staterr(rx_desc,
+						   BIT(IAVF_RXD_QW1_ERROR_SHIFT));
+
+			if (iavf_xdp_frame_runnable(eop, rx_ring->xdp_discard,
+						    rx_err)) {
+				hr = rx_buffer->page->pp->p.offset;
+				xdp_init_buff(&xdp, rx_buffer->truesize,
+					      &rx_ring->xdp_rxq);
+				xdp_prepare_buff(&xdp,
+						 page_address(rx_buffer->page) +
+						 rx_buffer->offset,
+						 hr, size, true);
+				net_prefetch(xdp.data);
+				act = iavf_run_xdp(rx_ring, xdp_prog, &xdp);
+			}
+			rcu_read_unlock();
+
+			if (act != XDP_PASS) {
+				page_pool_put_full_page(rx_ring->pp,
+							rx_buffer->page, true);
+				rx_ring->xdp_discard = !eop;
+				total_rx_bytes += size;
+				if (eop)
+					total_rx_packets++;
+				goto skip_data;
+			}
+
+			skb = iavf_xdp_build_skb(&xdp);
+			if (unlikely(!skb)) {
+				rx_ring->rx_stats.alloc_buff_failed++;
+				break;
+			}
+
+			goto skip_data;
+		}
+		rcu_read_unlock();
 		/* retrieve a buffer from the ring */
 		if (skb)
 			iavf_add_rx_frag(skb, rx_buffer, size);
@@ -1253,6 +1398,7 @@ skip_data:
 	/* guarantee a trip back through this routine if there was a failure */
 	return failure ? budget : (int)total_rx_packets;
 }
+EXPORT_SYMBOL_IF_KUNIT(iavf_clean_rx_irq);
 
 static inline u32 iavf_buildreg_itr(const int type, u16 itr)
 {

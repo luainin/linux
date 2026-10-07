@@ -4,6 +4,29 @@
 #ifndef _IAVF_TXRX_H_
 #define _IAVF_TXRX_H_
 
+#include <linux/bpf.h>
+#include <net/libeth/rx.h>
+#include <net/xdp.h>
+
+/**
+ * iavf_xdp_mtu_ok - can this MTU fit a frame in a single Rx buffer
+ * @mtu: MTU value (netdev->mtu or a proposed new_mtu) to check
+ *
+ * Early UX check only - mirrors libeth_rx_page_pool_params()'s sizing so
+ * attach is refused up front with a clear error instead of the PF silently
+ * truncating jumbo frames. The actual guarantee that a frame never spans
+ * more than one Rx buffer while a program is attached comes from clamping
+ * rxq.max_pkt_size in iavf_configure_queues(), not from this MTU check.
+ *
+ * Pure predicate so it can be exercised directly by KUnit, see
+ * iavf_txrx_kunit_test.c.
+ */
+static inline bool iavf_xdp_mtu_ok(int mtu)
+{
+	return mtu + LIBETH_RX_LL_LEN <=
+	       LIBETH_RX_PAGE_LEN(LIBETH_XDP_HEADROOM);
+}
+
 /* Interrupt Throttling and Rate Limiting Goodies */
 #define IAVF_DEFAULT_IRQ_WORK      256
 
@@ -294,8 +317,19 @@ struct iavf_ring {
 					 * iavf_clean_rx_ring_irq() is called
 					 * for this ring.
 					 */
+	bool xdp_discard;		/* Rx-only: drop descriptors up to EOP */
 
 	u32 rx_buf_len;
+
+	/* Rx-only: mirrors adapter->xdp_prog, re-applied from it whenever
+	 * the ring is (re)allocated. RCU-protected: rcu_assign_pointer()
+	 * under adapter->crit_lock, rcu_dereference() in NAPI poll.
+	 */
+	struct bpf_prog __rcu	*xdp_prog;
+	/* Rx-only: XDP_REDIRECT bookkeeping (device/queue a frame arrived
+	 * on), registered in iavf_setup_rx_descriptors().
+	 */
+	struct xdp_rxq_info	xdp_rxq;
 } ____cacheline_internodealigned_in_smp;
 
 #define IAVF_ITR_ADAPTIVE_MIN_INC	0x0002
@@ -399,4 +433,40 @@ static inline struct netdev_queue *txring_txq(const struct iavf_ring *ring)
 {
 	return netdev_get_tx_queue(ring->netdev, ring->queue_index);
 }
+
+/**
+ * iavf_xdp_clamp_max_frame - HW max frame size to program for an Rx queue
+ * @max_frame: frame size derived from the PF limit and libie
+ * @rx_buf_len: Rx buffer length of the queue
+ * @xdp: whether a native XDP program is attached
+ *
+ * A program only sees the first buffer of a frame, so cap the frame to one
+ * buffer while it is attached and let the HW drop anything larger.
+ */
+static inline u32 iavf_xdp_clamp_max_frame(u32 max_frame, u32 rx_buf_len,
+					   bool xdp)
+{
+	return xdp ? min(max_frame, rx_buf_len) : max_frame;
+}
+
+/**
+ * iavf_xdp_frame_runnable - may the program be run on this descriptor
+ * @eop: descriptor is the last one of its frame
+ * @discard: an earlier descriptor of this frame was already dropped
+ * @rx_err: HW flagged the frame as bad
+ */
+static inline bool iavf_xdp_frame_runnable(bool eop, bool discard, bool rx_err)
+{
+	return eop && !discard && !rx_err;
+}
+
+#if IS_ENABLED(CONFIG_KUNIT)
+struct bpf_prog;
+struct xdp_buff;
+
+u32 iavf_run_xdp(struct iavf_ring *rx_ring, struct bpf_prog *xdp_prog,
+		 struct xdp_buff *xdp);
+struct sk_buff *iavf_xdp_build_skb(const struct xdp_buff *xdp);
+int iavf_clean_rx_irq(struct iavf_ring *rx_ring, int budget);
+#endif
 #endif /* _IAVF_TXRX_H_ */

@@ -2,6 +2,7 @@
 /* Copyright(c) 2013 - 2018 Intel Corporation. */
 
 #include <linux/net/intel/libie/rx.h>
+#include <linux/netlink.h>
 
 #include "iavf.h"
 #include "iavf_prototype.h"
@@ -2624,6 +2625,11 @@ static void iavf_init_config_adapter(struct iavf_adapter *adapter)
 		netdev->max_mtu = adapter->vf_res->max_mtu - LIBETH_RX_LL_LEN;
 	}
 
+	/* netdev->xdp_features is intentionally left unset: NETDEV_XDP_ACT_BASIC
+	 * also advertises XDP_TX, which this driver does not implement (no
+	 * dedicated XDP Tx ring, no ndo_xdp_xmit). ndo_bpf works without it.
+	 */
+
 	if (!is_valid_ether_addr(adapter->hw.mac.addr)) {
 		dev_info(&pdev->dev, "Invalid MAC address %pM, using random\n",
 			 adapter->hw.mac.addr);
@@ -4452,6 +4458,16 @@ static int iavf_change_mtu(struct net_device *netdev, int new_mtu)
 	struct iavf_adapter *adapter = netdev_priv(netdev);
 	int ret = 0;
 
+	/* UX guard only: the real limit is the rxq.max_pkt_size clamp
+	 * iavf_configure_queues() applies while a program is attached.
+	 */
+	if (rcu_access_pointer(adapter->xdp_prog) && !iavf_xdp_mtu_ok(new_mtu)) {
+		netdev_warn(netdev,
+			    "MTU cannot be changed to %d while an XDP program is loaded\n",
+			    new_mtu);
+		return -EBUSY;
+	}
+
 	netdev_dbg(netdev, "changing MTU from %d to %d\n",
 		   netdev->mtu, new_mtu);
 	WRITE_ONCE(netdev->mtu, new_mtu);
@@ -4898,6 +4914,101 @@ static netdev_features_t iavf_fix_features(struct net_device *netdev,
 	return iavf_fix_strip_features(adapter, features);
 }
 
+/**
+ * iavf_xdp_setup - enable/disable/swap the XDP program on all Rx rings
+ * @adapter: board private structure
+ * @prog: new program (NULL to detach)
+ * @extack: netlink extack for error reporting
+ *
+ * NULL<->prog transitions change the Rx buffer headroom and the
+ * rxq.max_pkt_size clamp applied in iavf_configure_queues(), both of which
+ * only take effect once the rings are torn down and rebuilt, so those go
+ * through a full reset (like i40e_xdp_setup()). A prog-to-prog replacement
+ * changes neither and is a plain pointer swap.
+ *
+ * adapter->rx_rings / adapter->num_active_queues are also mutated by
+ * iavf_reset_task()/iavf_watchdog_task(), which run on a workqueue without
+ * rtnl_lock held. ndo_bpf() only guarantees rtnl_lock, so we still need
+ * adapter->crit_lock here - same trylock-with-remove-bailout idiom used by
+ * iavf_open()/iavf_close() - to avoid iterating a stale or concurrently
+ * freed rings array.
+ */
+static int iavf_xdp_setup(struct iavf_adapter *adapter, struct bpf_prog *prog,
+			  struct netlink_ext_ack *extack)
+{
+	struct bpf_prog *old_prog;
+	bool need_reset;
+	int i, ret = 0;
+
+	if (prog && !iavf_xdp_mtu_ok(adapter->netdev->mtu)) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "MTU too large for iavf XDP (single-buffer only)");
+		return -EOPNOTSUPP;
+	}
+
+	while (!mutex_trylock(&adapter->crit_lock)) {
+		if (adapter->state == __IAVF_REMOVE)
+			return -ENODEV;
+		usleep_range(500, 1000);
+	}
+
+	if (adapter->state == __IAVF_REMOVE) {
+		mutex_unlock(&adapter->crit_lock);
+		return -ENODEV;
+	}
+
+	old_prog = rcu_dereference_protected(adapter->xdp_prog,
+					     lockdep_is_held(&adapter->crit_lock));
+	need_reset = !old_prog != !prog;
+
+	/* On attach the rings must not see the program until the reset has
+	 * rebuilt them with XDP headroom and the max_pkt_size clamp; on
+	 * detach drop it right away so old_prog is never put while a ring
+	 * still references it.
+	 */
+	rcu_assign_pointer(adapter->xdp_prog, prog);
+	if (!need_reset || !prog)
+		for (i = 0; i < adapter->num_active_queues; i++)
+			rcu_assign_pointer(adapter->rx_rings[i].xdp_prog, prog);
+
+	mutex_unlock(&adapter->crit_lock);
+
+	if (need_reset && netif_running(adapter->netdev)) {
+		iavf_schedule_reset(adapter, IAVF_FLAG_RESET_NEEDED);
+		ret = iavf_wait_for_reset(adapter);
+		if (ret < 0)
+			netdev_warn(adapter->netdev,
+				    "XDP %s interrupted waiting for reset\n",
+				    prog ? "attach" : "detach");
+		else if (ret)
+			netdev_warn(adapter->netdev,
+				    "XDP %s timed out waiting for reset\n",
+				    prog ? "attach" : "detach");
+	}
+
+	if (old_prog)
+		bpf_prog_put(old_prog);
+
+	return ret < 0 ? ret : 0;
+}
+
+/**
+ * iavf_xdp - ndo_bpf handler
+ * @dev: netdev being configured
+ * @xdp: XDP command descriptor (program to set up, or query)
+ */
+static int iavf_xdp(struct net_device *dev, struct netdev_bpf *xdp)
+{
+	struct iavf_adapter *adapter = netdev_priv(dev);
+
+	switch (xdp->command) {
+	case XDP_SETUP_PROG:
+		return iavf_xdp_setup(adapter, xdp->prog, xdp->extack);
+	default:
+		return -EINVAL;
+	}
+}
+
 static const struct net_device_ops iavf_netdev_ops = {
 	.ndo_open		= iavf_open,
 	.ndo_stop		= iavf_close,
@@ -4913,6 +5024,7 @@ static const struct net_device_ops iavf_netdev_ops = {
 	.ndo_fix_features	= iavf_fix_features,
 	.ndo_set_features	= iavf_set_features,
 	.ndo_setup_tc		= iavf_setup_tc,
+	.ndo_bpf		= iavf_xdp,
 };
 
 /**

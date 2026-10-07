@@ -279,6 +279,14 @@ void iavf_configure_queues(struct iavf_adapter *adapter)
 	max_frame = LIBIE_MAX_RX_FRM_LEN(adapter->rx_rings->pp->p.offset);
 	max_frame = min_not_zero(adapter->vf_res->max_mtu, max_frame);
 
+	/* While a native XDP program is attached, clamp to one Rx buffer's
+	 * worth so the HW never chains a frame across multiple descriptors
+	 * - iavf_run_xdp() only ever inspects the first buffer of a frame.
+	 */
+	max_frame = iavf_xdp_clamp_max_frame(max_frame,
+					     adapter->rx_rings->rx_buf_len,
+					     rcu_access_pointer(adapter->xdp_prog));
+
 	if (adapter->current_op != VIRTCHNL_OP_UNKNOWN) {
 		/* bail because we already have a command pending */
 		dev_err(&adapter->pdev->dev, "Cannot configure queues, command %d pending\n",

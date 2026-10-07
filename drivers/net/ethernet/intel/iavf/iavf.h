@@ -4,6 +4,7 @@
 #ifndef _IAVF_H_
 #define _IAVF_H_
 
+#include <linux/bpf.h>
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/netdevice.h>
@@ -280,6 +281,11 @@ struct iavf_adapter {
 	u32 rx_desc_count;
 	int num_msix_vectors;
 	struct msix_entry *msix_entries;
+
+	/* Currently attached XDP program (DROP/PASS only); RCU-protected,
+	 * rcu_assign_pointer() under crit_lock.
+	 */
+	struct bpf_prog __rcu *xdp_prog;
 
 	u32 flags;
 #define IAVF_FLAG_RX_CSUM_ENABLED		BIT(0)

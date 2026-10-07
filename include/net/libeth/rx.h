@@ -13,8 +13,14 @@
 
 /* Space reserved in front of each frame */
 #define LIBETH_SKB_HEADROOM	(NET_SKB_PAD + NET_IP_ALIGN)
+/* Same, but with room for bpf_xdp_adjust_head()/_meta() while a native XDP
+ * program is attached (struct xdp_frame alone takes 40 of LIBETH_SKB_HEADROOM's
+ * usual 64 bytes, leaving a program almost no room to grow the frame)
+ */
+#define LIBETH_XDP_HEADROOM	\
+	ALIGN(XDP_PACKET_HEADROOM + NET_IP_ALIGN, sizeof(long))
 /* Maximum headroom for worst-case calculations */
-#define LIBETH_MAX_HEADROOM	LIBETH_SKB_HEADROOM
+#define LIBETH_MAX_HEADROOM	LIBETH_XDP_HEADROOM
 /* Link layer / L2 overhead: Ethernet, 2 VLAN tags (C + S), FCS */
 #define LIBETH_RX_LL_LEN	(ETH_HLEN + 2 * VLAN_HLEN + ETH_FCS_LEN)
 /* Maximum supported L2-L4 header length */
@@ -66,6 +72,7 @@ enum libeth_fqe_type {
  * @count: number of descriptors/buffers the queue has
  * @type: type of the buffers this queue has
  * @hsplit: flag whether header split is enabled
+ * @xdp: reserve ```LIBETH_XDP_HEADROOM``` instead of ```LIBETH_SKB_HEADROOM```
  * @buf_len: HW-writeable length per each buffer
  * @nid: ID of the closest NUMA node with memory
  */
@@ -81,6 +88,7 @@ struct libeth_fq {
 	/* Cold fields */
 	enum libeth_fqe_type	type:2;
 	bool			hsplit:1;
+	bool			xdp:1;
 
 	u32			buf_len;
 	int			nid;

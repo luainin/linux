@@ -259,6 +259,20 @@ config IAVF
 	tristate
 	select LIBIE
 
+config IAVF_KUNIT_TEST
+	tristate "KUnit test for iavf XDP helpers" if !KUNIT_ALL_TESTS
+	depends on KUNIT && IAVF
+	default KUNIT_ALL_TESTS
+	help
+	  This builds KUnit tests for iavf's pure-logic native XDP helpers
+	  (e.g. the single-buffer MTU boundary check), which need no
+	  adapter/netdev/hardware state.
+
+	  For more information on KUnit and unit tests in general, please
+	  refer to the KUnit documentation in Documentation/dev-tools/kunit/.
+
+	  If unsure, say N.
+
 config I40EVF
 	tristate "Intel(R) Ethernet Adaptive Virtual Function support"
 	select IAVF
