@@ -12,14 +12,14 @@ Status key: [ ] todo, [x] done.
 3. [x] KUnit test for the register_task re-entry path (fork: iavf_xdp_setup suite, 74 KUnit tests total).
 4. [x] NULL/size guard for rx_rings/num_active_queues in ndo_bpf if called before
    rings are allocated.
-5. [ ] VF reset and attach/detach during a storm (only a light ping flood so far).
+5. [x] VF reset and attach/detach during a storm: 51 detach/attach cycles + ring resizes (ethtool -G) under a 300k pps ip-unicast storm via VF-to-VF, 0 failures, no splats; attach logs 'reset still in progress, completing in background' (expected).
 6. [ ] Oversize-frame test on hardware; drop-flood under RT.
 7. [ ] kmemleak/KASAN on hardware (needs a debug kernel build).
 8. [ ] Multi-hour soak with storm + attach/detach churn.
 9. [ ] Non-iavf VF, VF hot-remove/re-add, live migration with a program attached.
-10. [ ] Audit stormcontrol programs for XDP_TX/REDIRECT use (unsupported: DROP/PASS only).
+10. [x] Audit stormcontrol programs for XDP_TX/REDIRECT use: done on the loaded xlated programs (xdp_entry + 7 filters); only ABORTED(0)/DROP(1)/PASS(2) returns, no redirect/adjust helper calls. Safe for DROP/PASS-only.
 11. [ ] Turn the fork override into a normal patch in the layer; decide on the
     fixbootloader /bzImage change (saved diff only).
 12. [ ] Upstream/netdev submission and Intel review; eSDK PR 85541 follow-up.
 13. [ ] Documented rollback (fall back to xdpgeneric) and staged-rollout plan.
-14. [ ] Re-run perf numbers VF-to-VF (earlier table measured hv_netvsc path only).
+14. [x] Re-run perf numbers VF-to-VF (earlier table measured hv_netvsc path only).
