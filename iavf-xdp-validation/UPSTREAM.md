@@ -1,7 +1,6 @@
 # Upstreaming plan (iavf native XDP, DROP/PASS only)
 
-Status: not submitted. eSDK PR 85541 is an Azure DevOps PR and was not
-reachable with `gh`; check its comments there.
+Status: not submitted. The Azure DevOps PR 85541 was abandoned (not needed).
 
 ## Before sending anything to netdev / Intel
 1. Rebase onto current `net-next` (this tree is NI nilrt 6.12). Intel has been
