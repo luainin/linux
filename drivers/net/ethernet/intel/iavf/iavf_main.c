@@ -1979,7 +1979,9 @@ static void iavf_finish_config(struct work_struct *work)
 	switch (adapter->state) {
 	case __IAVF_DOWN:
 		if (adapter->netdev->reg_state != NETREG_REGISTERED) {
+			WRITE_ONCE(adapter->register_task, current);
 			err = register_netdevice(adapter->netdev);
+			WRITE_ONCE(adapter->register_task, NULL);
 			if (err) {
 				dev_err(&adapter->pdev->dev, "Unable to register netdev (%d)\n",
 					err);
@@ -4937,7 +4939,7 @@ static int iavf_xdp_setup(struct iavf_adapter *adapter, struct bpf_prog *prog,
 			  struct netlink_ext_ack *extack)
 {
 	struct bpf_prog *old_prog;
-	bool need_reset;
+	bool need_reset, locked;
 	int i, ret = 0;
 
 	if (prog && !iavf_xdp_mtu_ok(adapter->netdev->mtu)) {
@@ -4946,15 +4948,21 @@ static int iavf_xdp_setup(struct iavf_adapter *adapter, struct bpf_prog *prog,
 		return -EOPNOTSUPP;
 	}
 
-	while (!mutex_trylock(&adapter->crit_lock)) {
-		if (adapter->state == __IAVF_REMOVE)
-			return -ENODEV;
-		usleep_range(500, 1000);
-	}
+	/* Called from our own register_netdevice() (hv_netvsc pushes its
+	 * program to a newly registered VF): crit_lock is already held.
+	 */
+	locked = READ_ONCE(adapter->register_task) == current;
+	if (!locked) {
+		while (!mutex_trylock(&adapter->crit_lock)) {
+			if (adapter->state == __IAVF_REMOVE)
+				return -ENODEV;
+			usleep_range(500, 1000);
+		}
 
-	if (adapter->state == __IAVF_REMOVE) {
-		mutex_unlock(&adapter->crit_lock);
-		return -ENODEV;
+		if (adapter->state == __IAVF_REMOVE) {
+			mutex_unlock(&adapter->crit_lock);
+			return -ENODEV;
+		}
 	}
 
 	old_prog = rcu_dereference_protected(adapter->xdp_prog,
@@ -4971,7 +4979,8 @@ static int iavf_xdp_setup(struct iavf_adapter *adapter, struct bpf_prog *prog,
 		for (i = 0; i < adapter->num_active_queues; i++)
 			rcu_assign_pointer(adapter->rx_rings[i].xdp_prog, prog);
 
-	mutex_unlock(&adapter->crit_lock);
+	if (!locked)
+		mutex_unlock(&adapter->crit_lock);
 
 	if (need_reset && netif_running(adapter->netdev)) {
 		iavf_schedule_reset(adapter, IAVF_FLAG_RESET_NEEDED);

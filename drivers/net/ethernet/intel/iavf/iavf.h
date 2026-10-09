@@ -287,6 +287,12 @@ struct iavf_adapter {
 	 */
 	struct bpf_prog __rcu *xdp_prog;
 
+	/* Task inside register_netdevice() with crit_lock held. A NETDEV_REGISTER
+	 * notifier (hv_netvsc) may call ndo_bpf from that context, so
+	 * iavf_xdp_setup() must not try to take crit_lock again.
+	 */
+	struct task_struct *register_task;
+
 	u32 flags;
 #define IAVF_FLAG_RX_CSUM_ENABLED		BIT(0)
 #define IAVF_FLAG_PF_COMMS_FAILED		BIT(3)
