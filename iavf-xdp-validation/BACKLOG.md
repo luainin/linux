@@ -13,7 +13,7 @@ Status key: [ ] todo, [x] done.
 4. [x] NULL/size guard for rx_rings/num_active_queues in ndo_bpf if called before
    rings are allocated.
 5. [x] VF reset and attach/detach during a storm: 51 detach/attach cycles + ring resizes (ethtool -G) under a 300k pps ip-unicast storm via VF-to-VF, 0 failures, no splats; attach logs 'reset still in progress, completing in background' (expected).
-6. [ ] Oversize-frame test on hardware; drop-flood under RT.
+6. [x] Oversize frames: 1514 B @ 320k pps storm and 9000 B frames (sender MTU 9000) into MTU-1500 VF with native XDP: no splats; 9000 B never reach the VF (PF drops). MTU change with XDP loaded is rejected (ndo_change_mtu and hv_netvsc: 'mtu too large'; XDP attach at MTU 9000 -> EOPNOTSUPP). Drop-flood under RT: DUT stayed responsive, no splats. Real RT latency (cyclictest) not measured.
 7. [ ] kmemleak/KASAN on hardware (needs a debug kernel build).
 8. [ ] Multi-hour soak with storm + attach/detach churn.
 9. [ ] Non-iavf VF, VF hot-remove/re-add, live migration with a program attached.
