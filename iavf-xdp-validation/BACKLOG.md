@@ -14,7 +14,7 @@ Status key: [ ] todo, [x] done.
    rings are allocated.
 5. [x] VF reset and attach/detach during a storm: 51 detach/attach cycles + ring resizes (ethtool -G) under a 300k pps ip-unicast storm via VF-to-VF, 0 failures, no splats; attach logs 'reset still in progress, completing in background' (expected).
 6. [x] Oversize frames: 1514 B @ 320k pps storm and 9000 B frames (sender MTU 9000) into MTU-1500 VF with native XDP: no splats; 9000 B never reach the VF (PF drops). MTU change with XDP loaded is rejected (ndo_change_mtu and hv_netvsc: 'mtu too large'; XDP attach at MTU 9000 -> EOPNOTSUPP). Drop-flood under RT: DUT stayed responsive, no splats. Real RT latency (cyclictest) not measured.
-7. [ ] kmemleak/KASAN on hardware (needs a debug kernel build).
+7. [x] kmemleak/KASAN/lockdep debug kernel (fork dcfb2688eafe, IAVF_DEBUG_KERNEL in the layer recipe): validation pack 25/25 incl. kmemleak (no leaks), and 11 attach/detach+ring-resize cycles under a 300k pps storm: 0 kmemleak reports, 0 KASAN/BUG/WARN from iavf XDP code. Pre-existing boot splats are NOT in XDP code: 'suspicious RCU usage' (RCU_NOCB, rcuc/0), and 'sleeping function called from invalid context' from iavf_request_misc_irq -> hv_compose_msi_msg (pci-hyperv takes a sleeping RT lock under irq_desc lock). The first splat turns lockdep off, so lockdep coverage is limited.
 8. [ ] Multi-hour soak with storm + attach/detach churn.
 9. [ ] Non-iavf VF, VF hot-remove/re-add, live migration with a program attached.
 10. [x] Audit stormcontrol programs for XDP_TX/REDIRECT use: done on the loaded xlated programs (xdp_entry + 7 filters); only ABORTED(0)/DROP(1)/PASS(2) returns, no redirect/adjust helper calls. Safe for DROP/PASS-only.
