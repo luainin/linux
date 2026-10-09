@@ -35,6 +35,7 @@ done
 
 cleanup() {
 	[ -n "$IFACE" ] && ip link set dev "$IFACE" xdp off 2>/dev/null
+	rm -f /sys/fs/bpf/xdpt_* 2>/dev/null
 	[ "$VETH" = 1 ] && { ip netns del xdpt-peer 2>/dev/null; ip link del xdpt0 2>/dev/null; }
 }
 trap cleanup EXIT
@@ -59,7 +60,13 @@ echo "== interface $IFACE driver=${DRIVER:-unknown} peer=${PEER_IP:-none} loops=
 kmsg_mark() { dmesg | wc -l; }
 MARK=$(kmsg_mark)
 
-attach()  { ip -force link set dev "$IFACE" xdpdrv obj "$BPF/xdp_$1.bpf.o" sec xdp; }
+# bpftool handles BTF-defined maps; legacy iproute2 loaders reject them with EACCES.
+attach()  {
+	local pin=/sys/fs/bpf/xdpt_$1
+	rm -f "$pin"
+	bpftool prog load "$BPF/xdp_$1.bpf.o" "$pin" type xdp &&
+		bpftool net attach xdpdrv pinned "$pin" dev "$IFACE" overwrite
+}
 detach()  { ip link set dev "$IFACE" xdp off; }
 attached() { ip -d link show dev "$IFACE" | grep -q "prog/xdp"; }
 pingp()   { ping -c 3 -W 1 -i 0.2 "$PEER_IP"; }
