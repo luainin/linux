@@ -318,6 +318,7 @@ struct iavf_ring {
 					 * for this ring.
 					 */
 	bool xdp_discard;		/* Rx-only: drop descriptors up to EOP */
+	u64 xdp_drops;			/* Rx-only: frames dropped by XDP; 0 on Tx */
 
 	u32 rx_buf_len;
 

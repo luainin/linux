@@ -1965,18 +1965,20 @@ static void iavf_finish_config(struct work_struct *work)
 	struct iavf_adapter *adapter;
 	int pairs, err;
 
-	adapter = container_of(work, struct iavf_adapter, finish_config);
+	adapter = container_of(work, struct iavf_adapter,
+				 finish_config.work);
 
 	/* Always take RTNL first to prevent circular lock dependency.
 	 *
 	 * Do not sleep on RTNL here: adapter->wq is ordered, and ndo_bpf()
 	 * (iavf_xdp_setup()) waits for iavf_reset_task() with RTNL held. If we
 	 * block on RTNL ahead of that reset_task in the queue, the reset cannot
-	 * run until the wait times out. Requeue behind it instead.
+	 * run until the wait times out. Retry after a jiffy instead, behind it.
 	 */
 	if (!rtnl_trylock()) {
 		if (!test_bit(__IAVF_IN_REMOVE_TASK, &adapter->crit_section))
-			queue_work(adapter->wq, &adapter->finish_config);
+			queue_delayed_work(adapter->wq, &adapter->finish_config,
+					   1);
 		return;
 	}
 	mutex_lock(&adapter->crit_lock);
@@ -2034,7 +2036,7 @@ out:
 void iavf_schedule_finish_config(struct iavf_adapter *adapter)
 {
 	if (!test_bit(__IAVF_IN_REMOVE_TASK, &adapter->crit_section))
-		queue_work(adapter->wq, &adapter->finish_config);
+		queue_delayed_work(adapter->wq, &adapter->finish_config, 0);
 }
 
 /**
@@ -5030,7 +5032,7 @@ static int iavf_xdp(struct net_device *dev, struct netdev_bpf *xdp)
 	case XDP_SETUP_PROG:
 		return iavf_xdp_setup(adapter, xdp->prog, xdp->extack);
 	default:
-		return -EINVAL;
+		return -EOPNOTSUPP;
 	}
 }
 
@@ -5285,7 +5287,7 @@ static int iavf_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	INIT_WORK(&adapter->reset_task, iavf_reset_task);
 	INIT_WORK(&adapter->adminq_task, iavf_adminq_task);
-	INIT_WORK(&adapter->finish_config, iavf_finish_config);
+	INIT_DELAYED_WORK(&adapter->finish_config, iavf_finish_config);
 	INIT_DELAYED_WORK(&adapter->watchdog_task, iavf_watchdog_task);
 
 	/* Setup the wait queue for indicating transition to down status */
@@ -5431,7 +5433,7 @@ static void iavf_remove(struct pci_dev *pdev)
 		usleep_range(500, 1000);
 	}
 	cancel_delayed_work_sync(&adapter->watchdog_task);
-	cancel_work_sync(&adapter->finish_config);
+	cancel_delayed_work_sync(&adapter->finish_config);
 
 	if (netdev->reg_state == NETREG_REGISTERED)
 		unregister_netdev(netdev);

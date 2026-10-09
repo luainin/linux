@@ -55,6 +55,7 @@ struct iavf_stats {
 static const struct iavf_stats iavf_gstrings_queue_stats[] = {
 	IAVF_QUEUE_STAT("%s-%u.packets", stats.packets),
 	IAVF_QUEUE_STAT("%s-%u.bytes", stats.bytes),
+	IAVF_QUEUE_STAT("%s-%u.xdp_drops", xdp_drops),
 };
 
 /**

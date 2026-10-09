@@ -758,6 +758,8 @@ static void iavf_clean_rx_ring(struct iavf_ring *rx_ring)
 		rx_ring->skb = NULL;
 	}
 	rx_ring->xdp_discard = false;
+
+	/* Free all the Rx ring buffers */
 	for (u32 i = rx_ring->next_to_clean; i != rx_ring->next_to_use; ) {
 		const struct libeth_fqe *rx_fqes = &rx_ring->rx_fqes[i];
 
@@ -1232,6 +1234,7 @@ static bool iavf_is_non_eop(struct iavf_ring *rx_ring,
 VISIBLE_IF_KUNIT int iavf_clean_rx_irq(struct iavf_ring *rx_ring, int budget)
 {
 	unsigned int total_rx_bytes = 0, total_rx_packets = 0;
+	unsigned int total_xdp_drops = 0;
 	struct sk_buff *skb = rx_ring->skb;
 	u16 cleaned_count = IAVF_DESC_UNUSED(rx_ring);
 	bool failure = false;
@@ -1296,7 +1299,7 @@ VISIBLE_IF_KUNIT int iavf_clean_rx_irq(struct iavf_ring *rx_ring, int budget)
 
 			if (iavf_xdp_frame_runnable(eop, rx_ring->xdp_discard,
 						    rx_err)) {
-				hr = rx_buffer->page->pp->p.offset;
+				hr = rx_ring->pp->p.offset;
 				xdp_init_buff(&xdp, rx_buffer->truesize,
 					      &rx_ring->xdp_rxq);
 				xdp_prepare_buff(&xdp,
@@ -1308,22 +1311,26 @@ VISIBLE_IF_KUNIT int iavf_clean_rx_irq(struct iavf_ring *rx_ring, int budget)
 			}
 			rcu_read_unlock();
 
-			if (act != XDP_PASS) {
-				page_pool_put_full_page(rx_ring->pp,
-							rx_buffer->page, true);
-				rx_ring->xdp_discard = !eop;
-				total_rx_bytes += size;
-				if (eop)
-					total_rx_packets++;
-				goto skip_data;
-			}
+			if (act == XDP_PASS) {
+				skb = iavf_xdp_build_skb(&xdp);
+				if (likely(skb))
+					goto skip_data;
 
-			skb = iavf_xdp_build_skb(&xdp);
-			if (unlikely(!skb)) {
+				/* The program already ran on this frame, so
+				 * drop it rather than retrying and running it
+				 * a second time.
+				 */
 				rx_ring->rx_stats.alloc_buff_failed++;
-				break;
 			}
 
+			page_pool_put_full_page(rx_ring->pp,
+						rx_buffer->page, true);
+			rx_ring->xdp_discard = !eop;
+			total_rx_bytes += size;
+			if (eop) {
+				total_rx_packets++;
+				total_xdp_drops++;
+			}
 			goto skip_data;
 		}
 		rcu_read_unlock();
@@ -1390,6 +1397,7 @@ skip_data:
 
 	u64_stats_update_begin(&rx_ring->syncp);
 	rx_ring->stats.packets += total_rx_packets;
+	rx_ring->xdp_drops += total_xdp_drops;
 	rx_ring->stats.bytes += total_rx_bytes;
 	u64_stats_update_end(&rx_ring->syncp);
 	rx_ring->q_vector->rx.total_packets += total_rx_packets;

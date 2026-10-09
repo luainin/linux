@@ -255,7 +255,7 @@ struct iavf_adapter {
 	struct workqueue_struct *wq;
 	struct work_struct reset_task;
 	struct work_struct adminq_task;
-	struct work_struct finish_config;
+	struct delayed_work finish_config;
 	wait_queue_head_t down_waitqueue;
 	wait_queue_head_t reset_waitqueue;
 	wait_queue_head_t vc_waitqueue;
