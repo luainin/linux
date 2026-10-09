@@ -21,5 +21,5 @@ Status key: [ ] todo, [x] done.
 11. [ ] Turn the fork override into a normal patch in the layer; decide on the
     fixbootloader /bzImage change (saved diff only).
 12. [ ] Upstream/netdev submission and Intel review; eSDK PR 85541 follow-up.
-13. [ ] Documented rollback (fall back to xdpgeneric) and staged-rollout plan.
+13. [x] Rollback and staged rollout: documented in the layer (README-iavf-xdp-rollout.md).
 14. [x] Re-run perf numbers VF-to-VF (earlier table measured hv_netvsc path only).
