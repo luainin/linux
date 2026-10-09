@@ -463,10 +463,14 @@ static inline bool iavf_xdp_frame_runnable(bool eop, bool discard, bool rx_err)
 #if IS_ENABLED(CONFIG_KUNIT)
 struct bpf_prog;
 struct xdp_buff;
+struct iavf_adapter;
+struct netlink_ext_ack;
 
 u32 iavf_run_xdp(struct iavf_ring *rx_ring, struct bpf_prog *xdp_prog,
 		 struct xdp_buff *xdp);
 struct sk_buff *iavf_xdp_build_skb(const struct xdp_buff *xdp);
 int iavf_clean_rx_irq(struct iavf_ring *rx_ring, int budget);
+int iavf_xdp_setup(struct iavf_adapter *adapter, struct bpf_prog *prog,
+		   struct netlink_ext_ack *extack);
 #endif
 #endif /* _IAVF_TXRX_H_ */

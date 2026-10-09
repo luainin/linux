@@ -864,7 +864,147 @@ static struct kunit_suite iavf_rx_test_suite = {
 	.test_cases = iavf_rx_test_cases,
 };
 
-kunit_test_suites(&iavf_txrx_test_suite, &iavf_rx_test_suite);
+/* iavf_xdp_setup(): crit_lock handling and ring assignment */
+struct setup_ctx {
+	struct net_device *netdev;
+	struct iavf_adapter *adapter;
+	struct bpf_prog *prog;
+};
+
+static void setup_teardown(void *data)
+{
+	struct setup_ctx *c = data;
+
+	free_netdev(c->netdev);
+}
+
+static int setup_init(struct kunit *test)
+{
+	struct setup_ctx *c = kunit_kzalloc(test, sizeof(*c), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, c);
+	c->netdev = alloc_etherdev(sizeof(struct iavf_adapter));
+	KUNIT_ASSERT_NOT_NULL(test, c->netdev);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, setup_teardown, c), 0);
+	c->adapter = netdev_priv(c->netdev);
+	c->adapter->netdev = c->netdev;
+	c->adapter->num_active_queues = 2;
+	c->adapter->rx_rings = kunit_kcalloc(test, 2, sizeof(struct iavf_ring),
+					     GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, c->adapter->rx_rings);
+	mutex_init(&c->adapter->crit_lock);
+	c->prog = kunit_kzalloc(test, sizeof(*c->prog), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, c->prog);
+	c->prog->aux = kunit_kzalloc(test, sizeof(*c->prog->aux), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, c->prog->aux);
+	atomic64_set(&c->prog->aux->refcnt, 4);
+	test->priv = c;
+	return 0;
+}
+
+/* The netdev is not running, so no reset is scheduled; with a prog the
+ * rings are only assigned on a program swap (no reset needed).
+ */
+static void setup_attach_detach_test(struct kunit *test)
+{
+	struct setup_ctx *c = test->priv;
+	struct iavf_adapter *a = c->adapter;
+
+	KUNIT_ASSERT_EQ(test, iavf_xdp_setup(a, c->prog, NULL), 0);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(a->xdp_prog), c->prog);
+	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&a->crit_lock));
+
+	KUNIT_ASSERT_EQ(test, iavf_xdp_setup(a, NULL, NULL), 0);
+	KUNIT_EXPECT_NULL(test, rcu_access_pointer(a->xdp_prog));
+	KUNIT_EXPECT_NULL(test, rcu_access_pointer(a->rx_rings[0].xdp_prog));
+	KUNIT_EXPECT_NULL(test, rcu_access_pointer(a->rx_rings[1].xdp_prog));
+	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&a->crit_lock));
+}
+
+static void setup_swap_updates_rings_test(struct kunit *test)
+{
+	struct setup_ctx *c = test->priv;
+	struct iavf_adapter *a = c->adapter;
+	struct bpf_prog *other = kunit_kzalloc(test, sizeof(*other), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, other);
+	other->aux = c->prog->aux;
+	KUNIT_ASSERT_EQ(test, iavf_xdp_setup(a, c->prog, NULL), 0);
+	KUNIT_ASSERT_EQ(test, iavf_xdp_setup(a, other, NULL), 0);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(a->xdp_prog), other);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(a->rx_rings[0].xdp_prog), other);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(a->rx_rings[1].xdp_prog), other);
+}
+
+/* hv_netvsc pushes its program from inside register_netdevice(), where
+ * iavf_finish_config() already holds crit_lock: no trylock, no unlock.
+ */
+static void setup_registering_task_keeps_lock_test(struct kunit *test)
+{
+	struct setup_ctx *c = test->priv;
+	struct iavf_adapter *a = c->adapter;
+
+	mutex_lock(&a->crit_lock);
+	WRITE_ONCE(a->register_task, current);
+	KUNIT_ASSERT_EQ(test, iavf_xdp_setup(a, c->prog, NULL), 0);
+	WRITE_ONCE(a->register_task, NULL);
+	KUNIT_EXPECT_TRUE(test, mutex_is_locked(&a->crit_lock));
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(a->xdp_prog), c->prog);
+	mutex_unlock(&a->crit_lock);
+}
+
+static void setup_removed_adapter_test(struct kunit *test)
+{
+	struct setup_ctx *c = test->priv;
+	struct iavf_adapter *a = c->adapter;
+
+	a->state = __IAVF_REMOVE;
+	KUNIT_EXPECT_EQ(test, iavf_xdp_setup(a, c->prog, NULL), -ENODEV);
+	KUNIT_EXPECT_NULL(test, rcu_access_pointer(a->xdp_prog));
+	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&a->crit_lock));
+}
+
+static void setup_mtu_too_large_test(struct kunit *test)
+{
+	struct setup_ctx *c = test->priv;
+	struct iavf_adapter *a = c->adapter;
+
+	c->netdev->mtu = 9000;
+	KUNIT_EXPECT_EQ(test, iavf_xdp_setup(a, c->prog, NULL), -EOPNOTSUPP);
+	KUNIT_EXPECT_NULL(test, rcu_access_pointer(a->xdp_prog));
+}
+
+/* Rings not allocated yet (e.g. called before the first config): must not
+ * touch rx_rings.
+ */
+static void setup_without_rings_test(struct kunit *test)
+{
+	struct setup_ctx *c = test->priv;
+	struct iavf_adapter *a = c->adapter;
+
+	a->rx_rings = NULL;
+	KUNIT_EXPECT_EQ(test, iavf_xdp_setup(a, c->prog, NULL), 0);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(a->xdp_prog), c->prog);
+	KUNIT_EXPECT_EQ(test, iavf_xdp_setup(a, NULL, NULL), 0);
+}
+
+static struct kunit_case iavf_setup_test_cases[] = {
+	KUNIT_CASE(setup_attach_detach_test),
+	KUNIT_CASE(setup_swap_updates_rings_test),
+	KUNIT_CASE(setup_registering_task_keeps_lock_test),
+	KUNIT_CASE(setup_removed_adapter_test),
+	KUNIT_CASE(setup_mtu_too_large_test),
+	KUNIT_CASE(setup_without_rings_test),
+	{}
+};
+
+static struct kunit_suite iavf_setup_test_suite = {
+	.name = "iavf_xdp_setup",
+	.init = setup_init,
+	.test_cases = iavf_setup_test_cases,
+};
+
+kunit_test_suites(&iavf_txrx_test_suite, &iavf_rx_test_suite, &iavf_setup_test_suite);
 
 MODULE_DESCRIPTION("iavf XDP helper KUnit tests");
 MODULE_LICENSE("GPL");

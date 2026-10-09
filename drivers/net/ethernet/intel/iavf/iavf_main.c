@@ -4,6 +4,8 @@
 #include <linux/net/intel/libie/rx.h>
 #include <linux/netlink.h>
 
+#include <kunit/visibility.h>
+
 #include "iavf.h"
 #include "iavf_prototype.h"
 /* All iavf tracepoints are defined by the include below, which must
@@ -4935,8 +4937,9 @@ static netdev_features_t iavf_fix_features(struct net_device *netdev,
  * iavf_open()/iavf_close() - to avoid iterating a stale or concurrently
  * freed rings array.
  */
-static int iavf_xdp_setup(struct iavf_adapter *adapter, struct bpf_prog *prog,
-			  struct netlink_ext_ack *extack)
+VISIBLE_IF_KUNIT int iavf_xdp_setup(struct iavf_adapter *adapter,
+				    struct bpf_prog *prog,
+				    struct netlink_ext_ack *extack)
 {
 	struct bpf_prog *old_prog;
 	bool need_reset, locked;
@@ -4975,7 +4978,7 @@ static int iavf_xdp_setup(struct iavf_adapter *adapter, struct bpf_prog *prog,
 	 * still references it.
 	 */
 	rcu_assign_pointer(adapter->xdp_prog, prog);
-	if (!need_reset || !prog)
+	if ((!need_reset || !prog) && adapter->rx_rings)
 		for (i = 0; i < adapter->num_active_queues; i++)
 			rcu_assign_pointer(adapter->rx_rings[i].xdp_prog, prog);
 
@@ -5002,6 +5005,7 @@ static int iavf_xdp_setup(struct iavf_adapter *adapter, struct bpf_prog *prog,
 
 	return 0;
 }
+EXPORT_SYMBOL_IF_KUNIT(iavf_xdp_setup);
 
 /**
  * iavf_xdp - ndo_bpf handler

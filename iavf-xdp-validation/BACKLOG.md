@@ -9,8 +9,8 @@ Status key: [ ] todo, [x] done.
    was committed; hv_netvsc then saw vf_setxdp failed and retries hit "already
    attached". Fixed (fork ab9b2a24060b). Stock iavf_change_mtu has the same
    -EBUSY pattern (not changed, stock behaviour).
-3. [ ] KUnit test for the register_task re-entry path (currently hardware-only).
-4. [ ] NULL/size guard for rx_rings/num_active_queues in ndo_bpf if called before
+3. [x] KUnit test for the register_task re-entry path (fork: iavf_xdp_setup suite, 74 KUnit tests total).
+4. [x] NULL/size guard for rx_rings/num_active_queues in ndo_bpf if called before
    rings are allocated.
 5. [ ] VF reset and attach/detach during a storm (only a light ping flood so far).
 6. [ ] Oversize-frame test on hardware; drop-flood under RT.
