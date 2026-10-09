@@ -19,6 +19,6 @@ Status key: [ ] todo, [x] done.
 9. [~] VF hot-remove/re-add (SR-IOV IovWeight 0 -> 100 on the Pri adapter, debug kernel, ping and XDP attached): VF removal and re-add are clean, 0 KASAN, 0 kmemleak; a DROP program on the master kept dropping on the synthetic path after removal and on the VF path after re-add, and traffic recovered on detach. Still untested: non-iavf VF and live migration.
 10. [x] Audit stormcontrol programs for XDP_TX/REDIRECT use: done on the loaded xlated programs (xdp_entry + 7 filters); only ABORTED(0)/DROP(1)/PASS(2) returns, no redirect/adjust helper calls. Safe for DROP/PASS-only.
 11. [-] Dropped by decision: the layer keeps building from the fork branch (SRC_URI override + SRCREV:x64); no layer patch is maintained. Fixbootloader change stays a saved diff only.
-12. [ ] Upstream/netdev submission and Intel review; eSDK PR 85541 follow-up.
+12. [~] Upstream plan written in UPSTREAM.md (rebase on net-next, split the series, reviewer points); not submitted. PR 85541 is Azure DevOps, not reachable via gh.
 13. [x] Rollback and staged rollout: documented in the layer (README-iavf-xdp-rollout.md).
 14. [x] Re-run perf numbers VF-to-VF (earlier table measured hv_netvsc path only).
