@@ -4940,7 +4940,7 @@ static int iavf_xdp_setup(struct iavf_adapter *adapter, struct bpf_prog *prog,
 {
 	struct bpf_prog *old_prog;
 	bool need_reset, locked;
-	int i, ret = 0;
+	int i, ret;
 
 	if (prog && !iavf_xdp_mtu_ok(adapter->netdev->mtu)) {
 		NL_SET_ERR_MSG_MOD(extack,
@@ -4984,21 +4984,23 @@ static int iavf_xdp_setup(struct iavf_adapter *adapter, struct bpf_prog *prog,
 
 	if (need_reset && netif_running(adapter->netdev)) {
 		iavf_schedule_reset(adapter, IAVF_FLAG_RESET_NEEDED);
+		/* The program is already committed to the adapter and the
+		 * reset keeps running in the background, so a slow reset (a VF
+		 * without link can take longer than the wait) is not a failure.
+		 * Failing here would leave hv_netvsc believing the VF has no
+		 * program while it does.
+		 */
 		ret = iavf_wait_for_reset(adapter);
-		if (ret < 0)
+		if (ret)
 			netdev_warn(adapter->netdev,
-				    "XDP %s interrupted waiting for reset\n",
-				    prog ? "attach" : "detach");
-		else if (ret)
-			netdev_warn(adapter->netdev,
-				    "XDP %s timed out waiting for reset\n",
+				    "XDP %s: reset still in progress, completing in background\n",
 				    prog ? "attach" : "detach");
 	}
 
 	if (old_prog)
 		bpf_prog_put(old_prog);
 
-	return ret < 0 ? ret : 0;
+	return 0;
 }
 
 /**
