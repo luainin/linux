@@ -191,3 +191,12 @@ this. It needs a host setting change (needs sudo):
 (lasts until reboot; use an AppArmor profile or sysctl.d entry to persist).
 The SDK installed earlier under `/mnt/data/yocto-client/iq-esdk` was installed
 inside the container and does not work from the host.
+
+## Storm matrix on hardware
+
+`tests/storm_gen.py` (sender, stdlib only) generates Achilles-style storms;
+`tests/run_storm_matrix.sh <label> <size> <pps>` runs all eleven against the
+DUT with the production `/DeltaV/ebpf` programs loaded by `dvinit-stormcontrol`
+and prints master rx packets, busy CPU jiffies and SSH liveness. Results
+(DUT 4 vCPU, 15 s each, 4 sender procs) are in `meta-emerson-core`
+`recipes-kernel/linux/README-iavf-xdp.md`.
