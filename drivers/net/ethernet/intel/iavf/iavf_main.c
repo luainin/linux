@@ -1967,8 +1967,18 @@ static void iavf_finish_config(struct work_struct *work)
 
 	adapter = container_of(work, struct iavf_adapter, finish_config);
 
-	/* Always take RTNL first to prevent circular lock dependency */
-	rtnl_lock();
+	/* Always take RTNL first to prevent circular lock dependency.
+	 *
+	 * Do not sleep on RTNL here: adapter->wq is ordered, and ndo_bpf()
+	 * (iavf_xdp_setup()) waits for iavf_reset_task() with RTNL held. If we
+	 * block on RTNL ahead of that reset_task in the queue, the reset cannot
+	 * run until the wait times out. Requeue behind it instead.
+	 */
+	if (!rtnl_trylock()) {
+		if (!test_bit(__IAVF_IN_REMOVE_TASK, &adapter->crit_section))
+			queue_work(adapter->wq, &adapter->finish_config);
+		return;
+	}
 	mutex_lock(&adapter->crit_lock);
 
 	if ((adapter->flags & IAVF_FLAG_SETUP_NETDEV_FEATURES) &&
