@@ -29,6 +29,8 @@ done
 [ -n "$VF" ] && [ -n "$PEER_IP" ] || { echo "--vf and --peer-ip required" >&2; exit 2; }
 
 log() { echo "$(date +%T) $*" | tee -a "$LOG"; }
+# ms since boot; BusyBox date has no %N
+now_ms() { awk '{printf "%d\n", $1 * 1000}' /proc/uptime; }
 mem() { awk '/^MemAvailable:|^Slab:|^Percpu:/{printf "%s%s ", $1, $2}' /proc/meminfo; }
 vf_rx() { [ -n "$MASTER" ] && ethtool -S "$MASTER" | awk '/^ +vf_rx_packets:/{print $2}'; }
 vf_up() { ip -o link show dev "$VF" | grep -q '[<,]UP[,>]' &&
@@ -50,9 +52,9 @@ cycles=0 fails=0 rx=$(vf_rx)
 log "start vf=$VF peer=$PEER_IP minutes=$MINUTES interval=$INTERVAL $(mem)"
 while [ "$(date +%s)" -lt "$end" ]; do
 	cycles=$((cycles + 1))
-	t0=$(date +%s%N)
+	t0=$(now_ms)
 	$OFF >/dev/null 2>&1; $ON >/dev/null 2>&1
-	ms=$((($(date +%s%N) - t0) / 1000000))
+	ms=$(($(now_ms) - t0))
 	sleep 2
 	st=ok
 	vf_up || st="$st vf-down"

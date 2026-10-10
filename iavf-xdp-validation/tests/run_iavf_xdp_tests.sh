@@ -145,7 +145,7 @@ if [ "$DRIVER" = iavf ]; then
 	stats=$(ethtool -S "$IFACE" | sed -n 's/^ *\([^:]*\):.*/\1/p')
 	nrx=$(echo "$stats" | grep -c '^rx-[0-9]*\.packets$')
 	nxdp=$(echo "$stats" | grep -c '^rx-[0-9]*\.xdp_drops$')
-	first_xdp=$(echo "$stats" | grep -n '\.xdp_drops$' | head -1 | cut -d: -f1)
+	first_xdp=$(echo "$stats" | grep -n '\.xdp_drops$' | head -n 1 | cut -d: -f1)
 	last_stock=$(echo "$stats" | grep -n '^[rt]x-[0-9]*\.bytes$' | tail -1 | cut -d: -f1)
 	[ "$nrx" -gt 0 ] && [ "$nxdp" = "$nrx" ] && ok "one rx-N.xdp_drops per Rx queue ($nxdp)" \
 		|| bad "rx-N.xdp_drops count $nxdp, Rx queues $nrx"
@@ -172,7 +172,7 @@ fi
 # 5. kernel health
 if [ -w /sys/kernel/debug/kmemleak ]; then
 	echo scan > /sys/kernel/debug/kmemleak; sleep 5; echo scan > /sys/kernel/debug/kmemleak
-	[ -z "$(cat /sys/kernel/debug/kmemleak)" ] && ok "kmemleak: no leaks" || { bad "kmemleak reports"; head -40 /sys/kernel/debug/kmemleak; }
+	[ -z "$(cat /sys/kernel/debug/kmemleak)" ] && ok "kmemleak: no leaks" || { bad "kmemleak reports"; head -n 40 /sys/kernel/debug/kmemleak; }
 else
 	skip "kmemleak not available (CONFIG_DEBUG_KMEMLEAK / debugfs)"
 fi
