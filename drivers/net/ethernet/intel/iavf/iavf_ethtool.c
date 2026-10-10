@@ -55,6 +55,12 @@ struct iavf_stats {
 static const struct iavf_stats iavf_gstrings_queue_stats[] = {
 	IAVF_QUEUE_STAT("%s-%u.packets", stats.packets),
 	IAVF_QUEUE_STAT("%s-%u.bytes", stats.bytes),
+};
+
+/* Rx-only XDP stats, reported after all the stats above so that their
+ * positions in the ethtool -S output stay as they were before XDP support
+ */
+static const struct iavf_stats iavf_gstrings_rx_xdp_stats[] = {
 	IAVF_QUEUE_STAT("%s-%u.xdp_drops", xdp_drops),
 };
 
@@ -144,24 +150,24 @@ __iavf_add_ethtool_stats(u64 **data, void *pointer,
 	__iavf_add_ethtool_stats(data, pointer, stats, ARRAY_SIZE(stats))
 
 /**
- * iavf_add_queue_stats - copy queue statistics into supplied buffer
+ * __iavf_add_queue_stats - copy queue statistics into supplied buffer
  * @data: ethtool stats buffer
  * @ring: the ring to copy
+ * @stats: stat definitions array (fields of struct iavf_ring)
+ * @size: size of the stats array
  *
  * Queue statistics must be copied while protected by
  * u64_stats_fetch_begin, so we can't directly use iavf_add_ethtool_stats.
- * Assumes that queue stats are defined in iavf_gstrings_queue_stats. If the
- * ring pointer is null, zero out the queue stat values and update the data
- * pointer. Otherwise safely copy the stats from the ring into the supplied
+ * If the ring pointer is null, zero out the queue stat values and update the
+ * data pointer. Otherwise safely copy the stats from the ring into the supplied
  * buffer and update the data pointer when finished.
  *
  * This function expects to be called while under rcu_read_lock().
  **/
 static void
-iavf_add_queue_stats(u64 **data, struct iavf_ring *ring)
+__iavf_add_queue_stats(u64 **data, struct iavf_ring *ring,
+		       const struct iavf_stats *stats, const unsigned int size)
 {
-	const unsigned int size = ARRAY_SIZE(iavf_gstrings_queue_stats);
-	const struct iavf_stats *stats = iavf_gstrings_queue_stats;
 	unsigned int start;
 	unsigned int i;
 
@@ -179,6 +185,9 @@ iavf_add_queue_stats(u64 **data, struct iavf_ring *ring)
 	/* Once we successfully copy the stats in, update the data pointer */
 	*data += size;
 }
+
+#define iavf_add_queue_stats(data, ring, stats) \
+	__iavf_add_queue_stats(data, ring, stats, ARRAY_SIZE(stats))
 
 /**
  * __iavf_add_stat_strings - copy stat strings into ethtool buffer
@@ -240,6 +249,7 @@ static const struct iavf_stats iavf_gstrings_stats[] = {
 #define IAVF_STATS_LEN	ARRAY_SIZE(iavf_gstrings_stats)
 
 #define IAVF_QUEUE_STATS_LEN	ARRAY_SIZE(iavf_gstrings_queue_stats)
+#define IAVF_RX_XDP_STATS_LEN	ARRAY_SIZE(iavf_gstrings_rx_xdp_stats)
 
 /**
  * iavf_get_link_ksettings - Get Link Speed and Duplex settings
@@ -318,7 +328,8 @@ static int iavf_get_sset_count(struct net_device *netdev, int sset)
 
 	if (sset == ETH_SS_STATS)
 		return IAVF_STATS_LEN +
-		       (IAVF_QUEUE_STATS_LEN * 2 * netdev->num_tx_queues);
+		       (IAVF_QUEUE_STATS_LEN * 2 * netdev->num_tx_queues) +
+		       (IAVF_RX_XDP_STATS_LEN * netdev->num_tx_queues);
 	else
 		return -EINVAL;
 }
@@ -354,9 +365,13 @@ static void iavf_get_ethtool_stats(struct net_device *netdev,
 			rx_ring = &adapter->rx_rings[i];
 		}
 
-		iavf_add_queue_stats(&data, tx_ring);
-		iavf_add_queue_stats(&data, rx_ring);
+		iavf_add_queue_stats(&data, tx_ring, iavf_gstrings_queue_stats);
+		iavf_add_queue_stats(&data, rx_ring, iavf_gstrings_queue_stats);
 	}
+	for (i = 0; i < netdev->num_tx_queues; i++)
+		iavf_add_queue_stats(&data, i < adapter->num_active_queues ?
+					    &adapter->rx_rings[i] : NULL,
+				     iavf_gstrings_rx_xdp_stats);
 	rcu_read_unlock();
 }
 
@@ -382,6 +397,9 @@ static void iavf_get_stat_strings(struct net_device *netdev, u8 *data)
 		iavf_add_stat_strings(&data, iavf_gstrings_queue_stats,
 				      "rx", i);
 	}
+	for (i = 0; i < netdev->num_tx_queues; i++)
+		iavf_add_stat_strings(&data, iavf_gstrings_rx_xdp_stats,
+				      "rx", i);
 }
 
 /**

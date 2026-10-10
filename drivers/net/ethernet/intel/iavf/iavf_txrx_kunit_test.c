@@ -24,8 +24,9 @@
 MODULE_IMPORT_NS(EXPORTED_FOR_KUNIT_TESTING);
 
 /* Largest MTU that still fits one Rx buffer, per libeth's own sizing. */
-#define IAVF_TEST_MAX_MTU \
-	((int)LIBETH_RX_PAGE_LEN(LIBETH_XDP_HEADROOM) - LIBETH_RX_LL_LEN)
+#define IAVF_TEST_MAX_MTU						\
+	((int)MIN_T(u32, LIBETH_RX_PAGE_LEN(LIBETH_XDP_HEADROOM),		\
+		    LIBIE_MAX_RX_BUF_LEN) - LIBETH_RX_LL_LEN)
 
 static void iavf_xdp_mtu_ok_test(struct kunit *test)
 {
@@ -75,9 +76,21 @@ static void iavf_xdp_mtu_param_test(struct kunit *test)
 static void iavf_xdp_mtu_fits_buffer_test(struct kunit *test)
 {
 	KUNIT_EXPECT_LE(test, IAVF_TEST_MAX_MTU + LIBETH_RX_LL_LEN,
-			(int)LIBETH_RX_PAGE_LEN(LIBETH_XDP_HEADROOM));
+			(int)LIBIE_RX_BUF_LEN(LIBETH_XDP_HEADROOM));
 	KUNIT_EXPECT_GT(test, IAVF_TEST_MAX_MTU + 1 + LIBETH_RX_LL_LEN,
+			(int)LIBIE_RX_BUF_LEN(LIBETH_XDP_HEADROOM));
+}
+
+/* The limit is the HW buffer, not the page: on 64K-page systems the page
+ * length is far above what one descriptor can hold.
+ */
+static void iavf_xdp_mtu_capped_by_hw_buffer_test(struct kunit *test)
+{
+	KUNIT_EXPECT_LE(test, IAVF_TEST_MAX_MTU + LIBETH_RX_LL_LEN,
+			(int)LIBIE_MAX_RX_BUF_LEN);
+	KUNIT_EXPECT_LE(test, IAVF_TEST_MAX_MTU + LIBETH_RX_LL_LEN,
 			(int)LIBETH_RX_PAGE_LEN(LIBETH_XDP_HEADROOM));
+	KUNIT_EXPECT_FALSE(test, iavf_xdp_mtu_ok(LIBIE_MAX_RX_BUF_LEN));
 }
 
 static void iavf_xdp_mtu_default_ok_test(struct kunit *test)
@@ -503,6 +516,7 @@ static void iavf_xdp_skb_shares_buffer_test(struct kunit *test)
 static struct kunit_case iavf_txrx_test_cases[] = {
 	KUNIT_CASE_PARAM(iavf_xdp_mtu_param_test, mtu_gen_params),
 	KUNIT_CASE(iavf_xdp_mtu_ok_test),
+	KUNIT_CASE(iavf_xdp_mtu_capped_by_hw_buffer_test),
 	KUNIT_CASE(iavf_xdp_mtu_fits_buffer_test),
 	KUNIT_CASE(iavf_xdp_mtu_default_ok_test),
 	KUNIT_CASE(iavf_xdp_headroom_test),
@@ -1419,7 +1433,204 @@ static struct kunit_suite iavf_setup_test_suite = {
 	.test_cases = iavf_setup_test_cases,
 };
 
-kunit_test_suites(&iavf_txrx_test_suite, &iavf_rx_test_suite, &iavf_setup_test_suite);
+/* iavf_xdp_rebuild() settle-wait: a PF-initiated reset can land while the VF
+ * is closed for the rebuild; the rebuild must wait it out and then reopen.
+ */
+struct settle_case {
+	enum iavf_state_t state;
+	u32 flags;
+	bool settling;
+	const char *name;
+};
+
+static const struct settle_case settle_cases[] = {
+	{ __IAVF_DOWN, 0, false, "down" },
+	{ __IAVF_RUNNING, 0, false, "running" },
+	{ __IAVF_COMM_FAILED, 0, false, "comm-failed" },
+	{ __IAVF_INIT_FAILED, 0, false, "init-failed" },
+	{ __IAVF_REMOVE, 0, false, "remove" },
+	{ __IAVF_TESTING, 0, false, "testing" },
+	{ __IAVF_DOWN_PENDING, 0, true, "down-pending" },
+	{ __IAVF_RESETTING, 0, true, "resetting" },
+	{ __IAVF_STARTUP, 0, true, "startup" },
+	{ __IAVF_INIT_VERSION_CHECK, 0, true, "init-version" },
+	{ __IAVF_INIT_GET_RESOURCES, 0, true, "init-resources" },
+	{ __IAVF_INIT_EXTENDED_CAPS, 0, true, "init-ext-caps" },
+	{ __IAVF_INIT_CONFIG_ADAPTER, 0, true, "init-config" },
+	{ __IAVF_INIT_SW, 0, true, "init-sw" },
+	{ __IAVF_DOWN, IAVF_FLAG_RESET_PENDING, true, "down+reset-pending" },
+	{ __IAVF_DOWN, IAVF_FLAG_RESET_NEEDED, true, "down+reset-needed" },
+	{ __IAVF_COMM_FAILED, IAVF_FLAG_RESET_NEEDED, true, "comm-failed+reset-needed" },
+	{ __IAVF_DOWN, IAVF_FLAG_QUEUES_DISABLED, false, "down+queues-disabled" },
+};
+
+static void settle_case_desc(const struct settle_case *c, char *desc)
+{
+	strscpy(desc, c->name, KUNIT_PARAM_DESC_SIZE);
+}
+
+KUNIT_ARRAY_PARAM(settle, settle_cases, settle_case_desc);
+
+static void xdp_settling_param_test(struct kunit *test)
+{
+	const struct settle_case *c = test->param_value;
+	struct iavf_adapter *a = test->priv;
+
+	a->state = c->state;
+	a->flags = c->flags;
+	KUNIT_EXPECT_EQ(test, iavf_xdp_settling(a), c->settling);
+}
+
+struct settle_flip {
+	struct delayed_work dwork;
+	struct iavf_adapter *adapter;
+	enum iavf_state_t state;
+	u32 clear_flags;
+};
+
+static void settle_flip_fn(struct work_struct *work)
+{
+	struct settle_flip *f = container_of(work, struct settle_flip,
+					     dwork.work);
+
+	f->adapter->flags &= ~f->clear_flags;
+	WRITE_ONCE(f->adapter->state, f->state);
+}
+
+static unsigned int settle_wait(struct kunit *test, struct settle_flip *f,
+				unsigned int flip_ms, unsigned int timeout_ms,
+				bool *settled)
+{
+	unsigned long start = jiffies;
+
+	INIT_DELAYED_WORK(&f->dwork, settle_flip_fn);
+	f->adapter = test->priv;
+	schedule_delayed_work(&f->dwork, msecs_to_jiffies(flip_ms));
+	*settled = iavf_xdp_wait_settled(f->adapter,
+					 jiffies + msecs_to_jiffies(timeout_ms));
+	cancel_delayed_work_sync(&f->dwork);
+	return jiffies_to_msecs(jiffies - start);
+}
+
+/* PF reset in flight: RESETTING -> DOWN while the rebuild waits */
+static void xdp_wait_settled_reset_finishes_test(struct kunit *test)
+{
+	struct iavf_adapter *a = test->priv;
+	struct settle_flip f = { .state = __IAVF_DOWN };
+	unsigned int ms;
+	bool settled;
+
+	a->state = __IAVF_RESETTING;
+	ms = settle_wait(test, &f, 100, 2000, &settled);
+	KUNIT_EXPECT_TRUE(test, settled);
+	KUNIT_EXPECT_EQ(test, a->state, __IAVF_DOWN);
+	KUNIT_EXPECT_GE(test, ms, 80U);
+	KUNIT_EXPECT_LT(test, ms, 1500U);
+}
+
+/* Reset requested but reset_task not yet run: the flag alone keeps waiting */
+static void xdp_wait_settled_pending_flag_test(struct kunit *test)
+{
+	struct iavf_adapter *a = test->priv;
+	struct settle_flip f = { .state = __IAVF_DOWN,
+				 .clear_flags = IAVF_FLAG_RESET_PENDING };
+	bool settled;
+
+	a->state = __IAVF_DOWN;
+	a->flags = IAVF_FLAG_RESET_PENDING;
+	settle_wait(test, &f, 100, 2000, &settled);
+	KUNIT_EXPECT_TRUE(test, settled);
+	KUNIT_EXPECT_FALSE(test, a->flags & IAVF_FLAG_RESET_PENDING);
+}
+
+/* Post-reset init sequence finishing in DOWN */
+static void xdp_wait_settled_init_finishes_test(struct kunit *test)
+{
+	struct iavf_adapter *a = test->priv;
+	struct settle_flip f = { .state = __IAVF_DOWN };
+	bool settled;
+
+	a->state = __IAVF_INIT_CONFIG_ADAPTER;
+	settle_wait(test, &f, 100, 2000, &settled);
+	KUNIT_EXPECT_TRUE(test, settled);
+}
+
+/* A reset that never finishes: give up at the deadline, not before/forever */
+static void xdp_wait_settled_timeout_test(struct kunit *test)
+{
+	struct iavf_adapter *a = test->priv;
+	struct settle_flip f = { .state = __IAVF_RESETTING };
+	unsigned int ms;
+	bool settled;
+
+	a->state = __IAVF_RESETTING;
+	ms = settle_wait(test, &f, 5000, 200, &settled);
+	KUNIT_EXPECT_FALSE(test, settled);
+	KUNIT_EXPECT_GE(test, ms, 180U);
+	KUNIT_EXPECT_LT(test, ms, 1000U);
+}
+
+/* Already settled: no sleeping, even with an expired deadline */
+static void xdp_wait_settled_immediate_test(struct kunit *test)
+{
+	struct iavf_adapter *a = test->priv;
+	unsigned long start = jiffies;
+
+	a->state = __IAVF_DOWN;
+	KUNIT_EXPECT_TRUE(test, iavf_xdp_wait_settled(a, jiffies - 1));
+	a->state = __IAVF_COMM_FAILED;
+	KUNIT_EXPECT_TRUE(test, iavf_xdp_wait_settled(a, jiffies + HZ));
+	KUNIT_EXPECT_LT(test, jiffies_to_msecs(jiffies - start), 20U);
+}
+
+/* Settling with an expired deadline returns false without sleeping */
+static void xdp_wait_settled_expired_test(struct kunit *test)
+{
+	struct iavf_adapter *a = test->priv;
+	unsigned long start = jiffies;
+
+	a->state = __IAVF_DOWN_PENDING;
+	KUNIT_EXPECT_FALSE(test, iavf_xdp_wait_settled(a, jiffies - 1));
+	KUNIT_EXPECT_LT(test, jiffies_to_msecs(jiffies - start), 20U);
+}
+
+/* The reset budget covers a slow PF; the rebuild never polls forever */
+static void xdp_reset_timeout_sane_test(struct kunit *test)
+{
+	KUNIT_EXPECT_GE(test, IAVF_XDP_RESET_TIMEOUT, 5 * HZ);
+	KUNIT_EXPECT_LE(test, IAVF_XDP_RESET_TIMEOUT, 30 * HZ);
+}
+
+static int settle_init(struct kunit *test)
+{
+	struct iavf_adapter *a = kunit_kzalloc(test, sizeof(*a), GFP_KERNEL);
+
+	if (!a)
+		return -ENOMEM;
+	test->priv = a;
+	return 0;
+}
+
+static struct kunit_case iavf_settle_test_cases[] = {
+	KUNIT_CASE_PARAM(xdp_settling_param_test, settle_gen_params),
+	KUNIT_CASE(xdp_wait_settled_reset_finishes_test),
+	KUNIT_CASE(xdp_wait_settled_pending_flag_test),
+	KUNIT_CASE(xdp_wait_settled_init_finishes_test),
+	KUNIT_CASE(xdp_wait_settled_timeout_test),
+	KUNIT_CASE(xdp_wait_settled_immediate_test),
+	KUNIT_CASE(xdp_wait_settled_expired_test),
+	KUNIT_CASE(xdp_reset_timeout_sane_test),
+	{}
+};
+
+static struct kunit_suite iavf_settle_test_suite = {
+	.name = "iavf_xdp_settle",
+	.init = settle_init,
+	.test_cases = iavf_settle_test_cases,
+};
+
+kunit_test_suites(&iavf_txrx_test_suite, &iavf_rx_test_suite,
+		  &iavf_setup_test_suite, &iavf_settle_test_suite);
 
 MODULE_DESCRIPTION("iavf XDP helper KUnit tests");
 MODULE_LICENSE("GPL");

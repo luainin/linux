@@ -4932,6 +4932,58 @@ static netdev_features_t iavf_fix_features(struct net_device *netdev,
 }
 
 /**
+ * iavf_xdp_settling - check whether the VF is still on its way to a stable state
+ * @adapter: board private structure
+ *
+ * True while a reset is pending or running, the queues are being disabled, or
+ * the post-reset init sequence (which ends in __IAVF_DOWN) is running. A PF
+ * can reset the VF at any time (e.g. a Linux PF on trust/MAC/VLAN changes), so
+ * the rebuild must wait this out before deciding whether it can reopen.
+ */
+VISIBLE_IF_KUNIT bool iavf_xdp_settling(struct iavf_adapter *adapter)
+{
+	if (iavf_is_reset_in_progress(adapter))
+		return true;
+
+	switch (READ_ONCE(adapter->state)) {
+	case __IAVF_DOWN_PENDING:
+	case __IAVF_STARTUP:
+	case __IAVF_INIT_VERSION_CHECK:
+	case __IAVF_INIT_GET_RESOURCES:
+	case __IAVF_INIT_EXTENDED_CAPS:
+	case __IAVF_INIT_CONFIG_ADAPTER:
+	case __IAVF_INIT_SW:
+		return true;
+	default:
+		return false;
+	}
+}
+EXPORT_SYMBOL_IF_KUNIT(iavf_xdp_settling);
+
+/**
+ * iavf_xdp_wait_settled - wait until iavf_xdp_settling() is false
+ * @adapter: board private structure
+ * @end: deadline in jiffies
+ *
+ * Polls rather than using iavf_wait_for_reset(): that returns early on a
+ * pending signal, and reset_task's failure paths never wake reset_waitqueue.
+ *
+ * Return: true if the VF settled before @end.
+ */
+VISIBLE_IF_KUNIT bool iavf_xdp_wait_settled(struct iavf_adapter *adapter,
+					    unsigned long end)
+{
+	while (iavf_xdp_settling(adapter)) {
+		if (!time_before(jiffies, end))
+			return false;
+		msleep(20);
+	}
+
+	return true;
+}
+EXPORT_SYMBOL_IF_KUNIT(iavf_xdp_wait_settled);
+
+/**
  * iavf_xdp_rebuild - rebuild the queues so a NULL<->prog change takes effect
  * @adapter: board private structure
  *
@@ -4943,6 +4995,11 @@ static netdev_features_t iavf_fix_features(struct net_device *netdev,
  * The rings can only be freed once the PF has confirmed the queues are
  * disabled. If it doesn't in time, fall back to a VF reset, which stops the
  * queues and frees the rings without that confirmation, then reopen.
+ *
+ * A reset the PF starts on its own while the VF is closed ends in
+ * __IAVF_DOWN without reopening (reset_task only reopens a running VF), so
+ * any such reset is waited out and the open retried rather than leaving the
+ * interface down.
  */
 VISIBLE_IF_KUNIT void iavf_xdp_rebuild(struct iavf_adapter *adapter)
 {
@@ -4963,28 +5020,29 @@ VISIBLE_IF_KUNIT void iavf_xdp_rebuild(struct iavf_adapter *adapter)
 		mutex_lock(&adapter->crit_lock);
 		iavf_schedule_reset(adapter, IAVF_FLAG_RESET_NEEDED);
 		mutex_unlock(&adapter->crit_lock);
+	}
 
-		/* Poll rather than iavf_wait_for_reset(): that returns early on
-		 * a pending signal, and reset_task's failure paths never wake
-		 * reset_waitqueue.
+	end = jiffies + IAVF_XDP_RESET_TIMEOUT;
+	for (;;) {
+		iavf_xdp_wait_settled(adapter, end);
+
+		/* Anything but DOWN means the PF failed or the VF is being
+		 * removed; whatever brings it back up rebuilds the rings with
+		 * the program.
 		 */
-		end = jiffies + IAVF_XDP_RESET_TIMEOUT;
-		while (iavf_is_reset_in_progress(adapter) &&
-		       time_before(jiffies, end))
-			msleep(20);
-	}
+		if (adapter->state != __IAVF_DOWN) {
+			netdev_err(netdev,
+				   "XDP: VF not down (state %d), bring it down and up to recover\n",
+				   adapter->state);
+			return;
+		}
 
-	/* Anything but DOWN means a reset or PF failure took over; whatever
-	 * brings the VF back up rebuilds the rings with the program.
-	 */
-	if (adapter->state != __IAVF_DOWN) {
-		netdev_err(netdev,
-			   "XDP: VF not down (state %d), bring it down and up to recover\n",
-			   adapter->state);
-		return;
+		err = iavf_open(netdev);
+		/* -EBUSY: a reset started between the check and the open */
+		if (err != -EBUSY || !time_before(jiffies, end))
+			break;
+		msleep(20);
 	}
-
-	err = iavf_open(netdev);
 	if (err) {
 		netdev_err(netdev,
 			   "XDP: failed to reopen the VF (%d), bring it down and up to recover\n",

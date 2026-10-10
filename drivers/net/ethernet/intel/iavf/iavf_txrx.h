@@ -5,6 +5,7 @@
 #define _IAVF_TXRX_H_
 
 #include <linux/bpf.h>
+#include <linux/net/intel/libie/rx.h>
 #include <net/libeth/rx.h>
 #include <net/xdp.h>
 
@@ -14,14 +15,16 @@
  * of the 500 ms iavf_close() already waits
  */
 #define IAVF_XDP_DOWN_TIMEOUT	(2 * HZ)
-/* iavf_xdp_rebuild(): how long the fallback VF reset may take */
+/* iavf_xdp_rebuild(): how long a VF reset (ours or the PF's) may take */
 #define IAVF_XDP_RESET_TIMEOUT	(10 * HZ)
 
 /**
  * iavf_xdp_mtu_ok - can this MTU fit a frame in a single Rx buffer
  * @mtu: MTU value (netdev->mtu or a proposed new_mtu) to check
  *
- * Early UX check only - mirrors libeth_rx_page_pool_params()'s sizing so
+ * Early UX check only - mirrors libeth's Rx buffer sizing (the smaller of
+ * the page length and the HW per-descriptor limit, which matters on 64K-page
+ * systems) so
  * attach is refused up front with a clear error instead of the PF silently
  * truncating jumbo frames. The actual guarantee that a frame never spans
  * more than one Rx buffer while a program is attached comes from clamping
@@ -33,7 +36,7 @@
 static inline bool iavf_xdp_mtu_ok(int mtu)
 {
 	return mtu + LIBETH_RX_LL_LEN <=
-	       LIBETH_RX_PAGE_LEN(LIBETH_XDP_HEADROOM);
+	       (int)LIBIE_RX_BUF_LEN(LIBETH_XDP_HEADROOM);
 }
 
 /* Interrupt Throttling and Rate Limiting Goodies */
@@ -484,5 +487,7 @@ int iavf_xdp_setup(struct iavf_adapter *adapter, struct bpf_prog *prog,
 		   struct netlink_ext_ack *extack);
 void iavf_xdp_release(struct iavf_adapter *adapter);
 void iavf_xdp_rebuild(struct iavf_adapter *adapter);
+bool iavf_xdp_settling(struct iavf_adapter *adapter);
+bool iavf_xdp_wait_settled(struct iavf_adapter *adapter, unsigned long end);
 #endif
 #endif /* _IAVF_TXRX_H_ */
