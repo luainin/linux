@@ -9,7 +9,10 @@
 #include <kunit/device.h>
 #include <kunit/test.h>
 #include <kunit/visibility.h>
+#include <linux/completion.h>
+#include <linux/delay.h>
 #include <linux/filter.h>
+#include <linux/kthread.h>
 #include <linux/etherdevice.h>
 #include <net/xdp.h>
 
@@ -719,6 +722,7 @@ static void rx_drop_counts_toward_budget_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rx_clean(c, 64), 0);
 	KUNIT_EXPECT_EQ(test, c->ring.stats.packets, 40ULL);
 	KUNIT_EXPECT_EQ(test, c->ring.stats.bytes, 4000ULL);
+	KUNIT_EXPECT_EQ(test, c->ring.xdp_drops, 40ULL);
 }
 
 static void rx_drop_budget_zero_test(struct kunit *test)
@@ -744,6 +748,7 @@ static void rx_unsupported_verdicts_dropped_test(struct kunit *test)
 		KUNIT_EXPECT_NULL(test, c->ring.skb);
 	}
 	KUNIT_EXPECT_EQ(test, fake_calls, (int)ARRAY_SIZE(verdicts));
+	KUNIT_EXPECT_EQ(test, c->ring.xdp_drops, (u64)ARRAY_SIZE(verdicts));
 }
 
 static void rx_multi_desc_dropped_through_eop_test(struct kunit *test)
@@ -842,7 +847,62 @@ static void rx_prog_swap_midstream_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, fake_calls, 2);
 }
 
+/* xdp_drops counts program DROP verdicts only */
+static void rx_xdp_drops_pass_not_counted_test(struct kunit *test)
+{
+	struct rx_ctx *c = test->priv;
+
+	rx_attach(c, XDP_PASS);
+	for (int i = 0; i < 4; i++)
+		rx_post(c, i, 100, true, false);
+	KUNIT_EXPECT_EQ(test, rx_clean(c, 64), 4);
+	KUNIT_EXPECT_EQ(test, c->ring.xdp_drops, 0ULL);
+}
+
+static void rx_xdp_drops_hw_error_not_counted_test(struct kunit *test)
+{
+	struct rx_ctx *c = test->priv;
+
+	rx_attach(c, XDP_DROP);
+	rx_post(c, 0, 100, true, true);
+	rx_post(c, 1, 100, true, false);
+	KUNIT_EXPECT_EQ(test, rx_clean(c, 64), 2);
+	KUNIT_EXPECT_EQ(test, fake_calls, 1);
+	KUNIT_EXPECT_EQ(test, c->ring.xdp_drops, 1ULL);
+}
+
+static void rx_xdp_drops_partial_frame_not_counted_test(struct kunit *test)
+{
+	struct rx_ctx *c = test->priv;
+
+	rx_attach(c, XDP_DROP);
+	rx_post(c, 0, 1024, false, false);
+	rx_post(c, 1, 100, true, false);
+	rx_post(c, 2, 100, true, false);
+	KUNIT_EXPECT_EQ(test, rx_clean(c, 64), 2);
+	KUNIT_EXPECT_EQ(test, fake_calls, 1);
+	KUNIT_EXPECT_EQ(test, c->ring.xdp_drops, 1ULL);
+}
+
+static void rx_xdp_drops_accumulate_across_calls_test(struct kunit *test)
+{
+	struct rx_ctx *c = test->priv;
+
+	rx_attach(c, XDP_DROP);
+	for (int round = 0; round < 3; round++) {
+		for (int i = 0; i < 10; i++)
+			rx_post(c, i, 100, true, false);
+		rx_clean(c, 64);
+	}
+	KUNIT_EXPECT_EQ(test, c->ring.xdp_drops, 30ULL);
+	KUNIT_EXPECT_EQ(test, c->ring.stats.packets, 30ULL);
+}
+
 static struct kunit_case iavf_rx_test_cases[] = {
+	KUNIT_CASE(rx_xdp_drops_pass_not_counted_test),
+	KUNIT_CASE(rx_xdp_drops_hw_error_not_counted_test),
+	KUNIT_CASE(rx_xdp_drops_partial_frame_not_counted_test),
+	KUNIT_CASE(rx_xdp_drops_accumulate_across_calls_test),
 	KUNIT_CASE(rx_no_prog_delivers_test),
 	KUNIT_CASE(rx_no_prog_multi_desc_test),
 	KUNIT_CASE(rx_pass_delivers_test),
@@ -988,7 +1048,155 @@ static void setup_without_rings_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, iavf_xdp_setup(a, NULL, NULL), 0);
 }
 
+/* iavf_remove() backstop for a program the upper device never detached */
+static void setup_release_drops_reference_test(struct kunit *test)
+{
+	struct setup_ctx *c = test->priv;
+	struct iavf_adapter *a = c->adapter;
+	s64 refs;
+
+	KUNIT_ASSERT_EQ(test, iavf_xdp_setup(a, c->prog, NULL), 0);
+	rcu_assign_pointer(a->rx_rings[0].xdp_prog, c->prog);
+	rcu_assign_pointer(a->rx_rings[1].xdp_prog, c->prog);
+	refs = atomic64_read(&c->prog->aux->refcnt);
+
+	mutex_lock(&a->crit_lock);
+	iavf_xdp_release(a);
+	mutex_unlock(&a->crit_lock);
+
+	KUNIT_EXPECT_NULL(test, rcu_access_pointer(a->xdp_prog));
+	KUNIT_EXPECT_NULL(test, rcu_access_pointer(a->rx_rings[0].xdp_prog));
+	KUNIT_EXPECT_NULL(test, rcu_access_pointer(a->rx_rings[1].xdp_prog));
+	KUNIT_EXPECT_EQ(test, atomic64_read(&c->prog->aux->refcnt), refs - 1);
+}
+
+static void setup_release_noop_when_detached_test(struct kunit *test)
+{
+	struct setup_ctx *c = test->priv;
+	struct iavf_adapter *a = c->adapter;
+	s64 refs;
+
+	KUNIT_ASSERT_EQ(test, iavf_xdp_setup(a, c->prog, NULL), 0);
+	KUNIT_ASSERT_EQ(test, iavf_xdp_setup(a, NULL, NULL), 0);
+	refs = atomic64_read(&c->prog->aux->refcnt);
+
+	mutex_lock(&a->crit_lock);
+	iavf_xdp_release(a);
+	iavf_xdp_release(a);
+	mutex_unlock(&a->crit_lock);
+
+	KUNIT_EXPECT_EQ(test, atomic64_read(&c->prog->aux->refcnt), refs);
+}
+
+static void setup_release_without_rings_test(struct kunit *test)
+{
+	struct setup_ctx *c = test->priv;
+	struct iavf_adapter *a = c->adapter;
+	s64 refs;
+
+	KUNIT_ASSERT_EQ(test, iavf_xdp_setup(a, c->prog, NULL), 0);
+	a->rx_rings = NULL;
+	refs = atomic64_read(&c->prog->aux->refcnt);
+
+	mutex_lock(&a->crit_lock);
+	iavf_xdp_release(a);
+	mutex_unlock(&a->crit_lock);
+
+	KUNIT_EXPECT_NULL(test, rcu_access_pointer(a->xdp_prog));
+	KUNIT_EXPECT_EQ(test, atomic64_read(&c->prog->aux->refcnt), refs - 1);
+}
+
+/* A reset holding crit_lock must delay ndo_bpf, never fail it: failing
+ * would make hv_netvsc unwind the master's program too (fail-open).
+ */
+#define HOLD_MS	300
+
+struct lock_holder {
+	struct iavf_adapter *adapter;
+	struct completion locked;
+	struct completion done;
+};
+
+static int lock_holder_fn(void *data)
+{
+	struct lock_holder *h = data;
+
+	mutex_lock(&h->adapter->crit_lock);
+	complete(&h->locked);
+	msleep(HOLD_MS);
+	mutex_unlock(&h->adapter->crit_lock);
+	complete(&h->done);
+	return 0;
+}
+
+static unsigned int setup_while_locked(struct kunit *test,
+				       struct bpf_prog *prog, int *ret)
+{
+	struct setup_ctx *c = test->priv;
+	struct lock_holder h = { .adapter = c->adapter };
+	struct task_struct *t;
+	unsigned long start;
+
+	init_completion(&h.locked);
+	init_completion(&h.done);
+	t = kthread_run(lock_holder_fn, &h, "iavf-kunit-lock");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(t));
+	wait_for_completion(&h.locked);
+
+	start = jiffies;
+	*ret = iavf_xdp_setup(c->adapter, prog, NULL);
+	wait_for_completion(&h.done);
+	return jiffies_to_msecs(jiffies - start);
+}
+
+static void setup_attach_waits_for_lock_test(struct kunit *test)
+{
+	struct setup_ctx *c = test->priv;
+	unsigned int ms;
+	int ret;
+
+	ms = setup_while_locked(test, c->prog, &ret);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_GE(test, ms, HOLD_MS / 2);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(c->adapter->xdp_prog),
+			    c->prog);
+	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&c->adapter->crit_lock));
+}
+
+static void setup_detach_waits_for_lock_test(struct kunit *test)
+{
+	struct setup_ctx *c = test->priv;
+	unsigned int ms;
+	int ret;
+
+	KUNIT_ASSERT_EQ(test, iavf_xdp_setup(c->adapter, c->prog, NULL), 0);
+	ms = setup_while_locked(test, NULL, &ret);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_GE(test, ms, HOLD_MS / 2);
+	KUNIT_EXPECT_NULL(test, rcu_access_pointer(c->adapter->xdp_prog));
+	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&c->adapter->crit_lock));
+}
+
+/* Removal while waiting for crit_lock bails out without committing */
+static void setup_remove_while_waiting_test(struct kunit *test)
+{
+	struct setup_ctx *c = test->priv;
+	struct iavf_adapter *a = c->adapter;
+
+	mutex_lock(&a->crit_lock);
+	a->state = __IAVF_REMOVE;
+	KUNIT_EXPECT_EQ(test, iavf_xdp_setup(a, c->prog, NULL), -ENODEV);
+	KUNIT_EXPECT_NULL(test, rcu_access_pointer(a->xdp_prog));
+	mutex_unlock(&a->crit_lock);
+}
+
 static struct kunit_case iavf_setup_test_cases[] = {
+	KUNIT_CASE(setup_release_drops_reference_test),
+	KUNIT_CASE(setup_release_noop_when_detached_test),
+	KUNIT_CASE(setup_release_without_rings_test),
+	KUNIT_CASE(setup_attach_waits_for_lock_test),
+	KUNIT_CASE(setup_detach_waits_for_lock_test),
+	KUNIT_CASE(setup_remove_while_waiting_test),
 	KUNIT_CASE(setup_attach_detach_test),
 	KUNIT_CASE(setup_swap_updates_rings_test),
 	KUNIT_CASE(setup_registering_task_keeps_lock_test),

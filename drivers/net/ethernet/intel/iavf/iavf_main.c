@@ -4968,11 +4968,25 @@ VISIBLE_IF_KUNIT int iavf_xdp_setup(struct iavf_adapter *adapter,
 	 */
 	locked = READ_ONCE(adapter->register_task) == current;
 	if (!locked) {
+		unsigned long start = jiffies;
+
+		/* Deliberately unbounded, like iavf_open()/iavf_close(): a
+		 * reset_task stuck on an unresponsive PF can hold crit_lock for
+		 * tens of seconds, but failing here would make hv_netvsc roll
+		 * back the program on the master too and leave the port
+		 * unfiltered exactly when the VF is unhealthy.
+		 */
 		while (!mutex_trylock(&adapter->crit_lock)) {
 			if (adapter->state == __IAVF_REMOVE)
 				return -ENODEV;
 			usleep_range(500, 1000);
 		}
+
+		if (time_after(jiffies, start + IAVF_XDP_SLOW_LOCK))
+			netdev_warn(adapter->netdev,
+				    "XDP %s: waited %u ms for a reset in progress\n",
+				    prog ? "attach" : "detach",
+				    jiffies_to_msecs(jiffies - start));
 
 		if (adapter->state == __IAVF_REMOVE) {
 			mutex_unlock(&adapter->crit_lock);
@@ -5024,6 +5038,34 @@ VISIBLE_IF_KUNIT int iavf_xdp_setup(struct iavf_adapter *adapter,
 	return 0;
 }
 EXPORT_SYMBOL_IF_KUNIT(iavf_xdp_setup);
+
+/**
+ * iavf_xdp_release - drop a program still attached when the VF goes away
+ * @adapter: board private structure, crit_lock held
+ *
+ * hv_netvsc installs programs with dev_xdp_propagate(), which the core does
+ * not track, so unregister_netdev() only detaches them if hv_netvsc's
+ * NETDEV_UNREGISTER handler does. Don't leak the reference if it didn't.
+ */
+VISIBLE_IF_KUNIT void iavf_xdp_release(struct iavf_adapter *adapter)
+{
+	struct bpf_prog *prog;
+	int i;
+
+	prog = rcu_replace_pointer(adapter->xdp_prog, NULL,
+				   lockdep_is_held(&adapter->crit_lock));
+	if (!prog)
+		return;
+
+	if (adapter->rx_rings)
+		for (i = 0; i < adapter->num_active_queues; i++)
+			RCU_INIT_POINTER(adapter->rx_rings[i].xdp_prog, NULL);
+
+	netdev_warn(adapter->netdev,
+		    "XDP program still attached on remove, releasing it\n");
+	bpf_prog_put(prog);
+}
+EXPORT_SYMBOL_IF_KUNIT(iavf_xdp_release);
 
 /**
  * iavf_xdp - ndo_bpf handler
@@ -5447,6 +5489,7 @@ static void iavf_remove(struct pci_dev *pdev)
 	mutex_lock(&adapter->crit_lock);
 	dev_info(&adapter->pdev->dev, "Removing device\n");
 	iavf_change_state(adapter, __IAVF_REMOVE);
+	iavf_xdp_release(adapter);
 
 	iavf_request_reset(adapter);
 	msleep(50);

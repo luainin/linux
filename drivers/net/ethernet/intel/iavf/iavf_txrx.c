@@ -1291,6 +1291,7 @@ VISIBLE_IF_KUNIT int iavf_clean_rx_irq(struct iavf_ring *rx_ring, int budget)
 			bool eop = iavf_test_staterr(rx_desc, IAVF_RXD_EOF);
 			u32 act = XDP_DROP;
 			struct xdp_buff xdp;
+			bool ran = false;
 			bool rx_err;
 			u32 hr;
 
@@ -1308,6 +1309,7 @@ VISIBLE_IF_KUNIT int iavf_clean_rx_irq(struct iavf_ring *rx_ring, int budget)
 						 hr, size, true);
 				net_prefetch(xdp.data);
 				act = iavf_run_xdp(rx_ring, xdp_prog, &xdp);
+				ran = true;
 			}
 			rcu_read_unlock();
 
@@ -1329,7 +1331,11 @@ VISIBLE_IF_KUNIT int iavf_clean_rx_irq(struct iavf_ring *rx_ring, int budget)
 			total_rx_bytes += size;
 			if (eop) {
 				total_rx_packets++;
-				total_xdp_drops++;
+				/* Only program verdicts, not HW errors, partial
+				 * frames or skb allocation failures.
+				 */
+				if (ran && act == XDP_DROP)
+					total_xdp_drops++;
 			}
 			goto skip_data;
 		}
