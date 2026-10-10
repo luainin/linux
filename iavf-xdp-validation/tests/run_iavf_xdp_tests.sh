@@ -147,10 +147,22 @@ if [ -w /sys/kernel/debug/kmemleak ]; then
 else
 	skip "kmemleak not available (CONFIG_DEBUG_KMEMLEAK / debugfs)"
 fi
-if dmesg | tail -n +$((MARK + 1)) | grep -E "BUG:|WARNING:|KASAN|possible .*lock|UBSAN|Oops" ; then
+# Known, not iavf: on PREEMPT_RT pci-hyperv takes a sleeping lock in
+# hv_compose_msi_msg() under the irq_desc raw lock, so every request_irq() on
+# a Hyper-V VF splats (stock `ip link set <vf> up` too). Count those reports
+# separately; anything else fails.
+splats=$(dmesg | tail -n +$((MARK + 1)) | awk '
+	function flush() { if (hdr != "") { if (known && hv) k++; else { u++; print hdr > "/dev/stderr" } } }
+	/BUG:|WARNING:|KASAN|possible .*lock|UBSAN|Oops/ {
+		flush(); hdr = $0; known = /sleeping function called from invalid context/; hv = 0; next }
+	/ hv_compose_msi_msg\+/ { hv = 1 }
+	END { flush(); printf "%d %d\n", u, k }')
+set -- $splats
+[ "${2:-0}" -gt 0 ] && echo "note: $2 known pci-hyperv RT splat(s) (hv_compose_msi_msg)"
+if [ "${1:-0}" -gt 0 ]; then
 	bad "kernel splat during tests"
 else
-	ok "no kernel splats in dmesg"
+	ok "no kernel splats in dmesg (besides known pci-hyperv RT)"
 fi
 
 echo "== passed=$PASS failed=$FAIL skipped=$SKIP"
