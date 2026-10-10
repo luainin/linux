@@ -264,9 +264,10 @@ config IAVF_KUNIT_TEST
 	depends on KUNIT && IAVF
 	default KUNIT_ALL_TESTS
 	help
-	  This builds KUnit tests for iavf's pure-logic native XDP helpers
-	  (e.g. the single-buffer MTU boundary check), which need no
-	  adapter/netdev/hardware state.
+	  This builds KUnit tests for iavf's native XDP support: the
+	  single-buffer MTU and frame-size helpers, the Rx clean path driven
+	  against a software descriptor ring and a real page pool, and
+	  ndo_bpf attach/detach/swap locking. No hardware is needed.
 
 	  For more information on KUnit and unit tests in general, please
 	  refer to the KUnit documentation in Documentation/dev-tools/kunit/.

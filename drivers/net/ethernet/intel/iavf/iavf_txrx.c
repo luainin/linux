@@ -1237,12 +1237,19 @@ VISIBLE_IF_KUNIT int iavf_clean_rx_irq(struct iavf_ring *rx_ring, int budget)
 	unsigned int total_xdp_drops = 0;
 	struct sk_buff *skb = rx_ring->skb;
 	u16 cleaned_count = IAVF_DESC_UNUSED(rx_ring);
+	struct bpf_prog *xdp_prog;
 	bool failure = false;
+
+	/* Sample the program once per poll; a swap or detach takes effect
+	 * from the next poll and the old program is freed after an RCU grace
+	 * period, i.e. not before rcu_read_unlock() below.
+	 */
+	rcu_read_lock();
+	xdp_prog = rcu_dereference(rx_ring->xdp_prog);
 
 	while (likely(total_rx_packets < (unsigned int)budget)) {
 		struct libeth_fqe *rx_buffer;
 		union iavf_rx_desc *rx_desc;
-		struct bpf_prog *xdp_prog;
 		unsigned int size;
 		u16 vlan_tag = 0;
 		u8 rx_ptype;
@@ -1278,16 +1285,23 @@ VISIBLE_IF_KUNIT int iavf_clean_rx_irq(struct iavf_ring *rx_ring, int budget)
 		iavf_trace(clean_rx_irq, rx_ring, rx_desc, skb);
 
 		rx_buffer = &rx_ring->rx_fqes[rx_ring->next_to_clean];
-		if (!libeth_rx_sync_for_cpu(rx_buffer, size))
+		if (!libeth_rx_sync_for_cpu(rx_buffer, size)) {
+			/* Zero-length buffer, already recycled by libeth. It
+			 * may still end a frame that is being discarded.
+			 */
+			if (iavf_test_staterr(rx_desc, IAVF_RXD_EOF))
+				rx_ring->xdp_discard = false;
 			goto skip_data;
+		}
 
 		/* While a program is attached max_pkt_size is clamped to one
 		 * buffer, so every frame is a single EOP descriptor; anything
 		 * else is dropped up to its EOP rather than fed to the program.
+		 * A discard in progress is finished even if the program was
+		 * detached meanwhile, so the rest of that frame never reaches
+		 * the stack as a frame of its own.
 		 */
-		rcu_read_lock();
-		xdp_prog = skb ? NULL : rcu_dereference(rx_ring->xdp_prog);
-		if (xdp_prog) {
+		if ((xdp_prog && !skb) || unlikely(rx_ring->xdp_discard)) {
 			bool eop = iavf_test_staterr(rx_desc, IAVF_RXD_EOF);
 			u32 act = XDP_DROP;
 			struct xdp_buff xdp;
@@ -1311,7 +1325,6 @@ VISIBLE_IF_KUNIT int iavf_clean_rx_irq(struct iavf_ring *rx_ring, int budget)
 				act = iavf_run_xdp(rx_ring, xdp_prog, &xdp);
 				ran = true;
 			}
-			rcu_read_unlock();
 
 			if (act == XDP_PASS) {
 				skb = iavf_xdp_build_skb(&xdp);
@@ -1339,7 +1352,7 @@ VISIBLE_IF_KUNIT int iavf_clean_rx_irq(struct iavf_ring *rx_ring, int budget)
 			}
 			goto skip_data;
 		}
-		rcu_read_unlock();
+
 		/* retrieve a buffer from the ring */
 		if (skb)
 			iavf_add_rx_frag(skb, rx_buffer, size);
@@ -1398,6 +1411,7 @@ skip_data:
 		/* update budget accounting */
 		total_rx_packets++;
 	}
+	rcu_read_unlock();
 
 	rx_ring->skb = skb;
 

@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Copyright(c) 2026 DeltaV StormControl. */
 
-/* KUnit tests for the pure-logic helpers backing iavf's DROP/PASS-only
- * native XDP support. They need no adapter/netdev/hardware state, so they
+/* KUnit tests for iavf's DROP/PASS-only native XDP support: the pure-logic
+ * helpers, the Rx clean path against a software descriptor ring and a real
+ * page pool, and ndo_bpf locking/rebuild decisions with a fake adapter. They
  * run under a plain KUnit build - no VM, no VF, no SR-IOV required.
  */
 
 #include <kunit/device.h>
+#include <kunit/static_stub.h>
 #include <kunit/test.h>
 #include <kunit/visibility.h>
 #include <linux/completion.h>
@@ -898,7 +900,94 @@ static void rx_xdp_drops_accumulate_across_calls_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, c->ring.stats.packets, 30ULL);
 }
 
+/* A frame being discarded must be finished even if the program is
+ * detached meanwhile: its tail must not reach the stack as a frame.
+ */
+static void rx_detach_mid_discard_drops_tail_test(struct kunit *test)
+{
+	struct rx_ctx *c = test->priv;
+	unsigned int delivered;
+
+	rx_attach(c, XDP_PASS);
+	rx_post(c, 0, 1024, false, false);
+	KUNIT_EXPECT_EQ(test, rx_clean(c, 64), 0);
+	KUNIT_ASSERT_TRUE(test, c->ring.xdp_discard);
+
+	rcu_assign_pointer(c->ring.xdp_prog, NULL);
+	delivered = c->qv.napi.rx_count;
+	rx_post(c, 0, 100, true, false);
+	KUNIT_EXPECT_EQ(test, rx_clean(c, 64), 1);
+	KUNIT_EXPECT_FALSE(test, c->ring.xdp_discard);
+	KUNIT_EXPECT_NULL(test, c->ring.skb);
+	KUNIT_EXPECT_EQ(test, c->qv.napi.rx_count, delivered);
+	/* Whole buffers counted, not an skb built from the tail */
+	KUNIT_EXPECT_EQ(test, c->ring.stats.bytes, 1124ULL);
+	KUNIT_EXPECT_EQ(test, fake_calls, 0);
+
+	/* The next frame goes up the stack normally */
+	rx_post(c, 0, 100, true, false);
+	KUNIT_EXPECT_EQ(test, rx_clean(c, 64), 1);
+	KUNIT_EXPECT_EQ(test, c->qv.napi.rx_count, delivered + 1);
+}
+
+/* Same with the tail split over more descriptors and polls */
+static void rx_detach_mid_discard_long_tail_test(struct kunit *test)
+{
+	struct rx_ctx *c = test->priv;
+	unsigned int delivered;
+
+	rx_attach(c, XDP_DROP);
+	rx_post(c, 0, 1024, false, false);
+	rx_clean(c, 64);
+	rcu_assign_pointer(c->ring.xdp_prog, NULL);
+	delivered = c->qv.napi.rx_count;
+
+	rx_post(c, 0, 1024, false, false);
+	KUNIT_EXPECT_EQ(test, rx_clean(c, 64), 0);
+	KUNIT_EXPECT_TRUE(test, c->ring.xdp_discard);
+	KUNIT_EXPECT_NULL(test, c->ring.skb);
+	rx_post(c, 0, 100, true, false);
+	KUNIT_EXPECT_EQ(test, rx_clean(c, 64), 1);
+	KUNIT_EXPECT_FALSE(test, c->ring.xdp_discard);
+	KUNIT_EXPECT_EQ(test, c->qv.napi.rx_count, delivered);
+	KUNIT_EXPECT_EQ(test, c->ring.xdp_drops, 0ULL);
+}
+
+/* A zero-length EOP descriptor still ends a discard */
+static void rx_zero_len_eop_ends_discard_test(struct kunit *test)
+{
+	struct rx_ctx *c = test->priv;
+
+	rx_attach(c, XDP_PASS);
+	rx_post(c, 0, 1024, false, false);
+	rx_post(c, 1, 0, true, false);
+	rx_post(c, 2, 100, true, false);
+	rx_clean(c, 64);
+	KUNIT_EXPECT_FALSE(test, c->ring.xdp_discard);
+	KUNIT_EXPECT_EQ(test, fake_calls, 1);
+	KUNIT_EXPECT_EQ(test, c->ring.next_to_clean, 3);
+}
+
+/* The program is sampled once per poll */
+static void rx_prog_sampled_once_per_poll_test(struct kunit *test)
+{
+	struct rx_ctx *c = test->priv;
+
+	rx_attach(c, XDP_DROP);
+	for (int i = 0; i < 8; i++)
+		rx_post(c, i, 100, true, false);
+	KUNIT_EXPECT_EQ(test, rx_clean(c, 64), 8);
+	KUNIT_EXPECT_EQ(test, fake_calls, 8);
+	KUNIT_EXPECT_EQ(test, c->ring.xdp_drops, 8ULL);
+	/* The poll-wide RCU section is balanced */
+	KUNIT_EXPECT_EQ(test, rcu_preempt_depth(), 0);
+}
+
 static struct kunit_case iavf_rx_test_cases[] = {
+	KUNIT_CASE(rx_detach_mid_discard_drops_tail_test),
+	KUNIT_CASE(rx_detach_mid_discard_long_tail_test),
+	KUNIT_CASE(rx_zero_len_eop_ends_discard_test),
+	KUNIT_CASE(rx_prog_sampled_once_per_poll_test),
 	KUNIT_CASE(rx_xdp_drops_pass_not_counted_test),
 	KUNIT_CASE(rx_xdp_drops_hw_error_not_counted_test),
 	KUNIT_CASE(rx_xdp_drops_partial_frame_not_counted_test),
@@ -1190,7 +1279,125 @@ static void setup_remove_while_waiting_test(struct kunit *test)
 	mutex_unlock(&a->crit_lock);
 }
 
+/* NULL<->prog transitions on a running VF rebuild the queues (stubbed:
+ * close/open need real hardware), without crit_lock held.
+ */
+static struct {
+	int calls;
+	bool locked;
+	struct bpf_prog *prog;
+	struct bpf_prog *ring_prog;
+	struct bpf_prog *watch;
+	s64 refs;
+} rebuild;
+
+static void fake_rebuild(struct iavf_adapter *adapter)
+{
+	rebuild.calls++;
+	rebuild.locked = mutex_is_locked(&adapter->crit_lock);
+	rebuild.prog = rcu_access_pointer(adapter->xdp_prog);
+	rebuild.ring_prog = rcu_access_pointer(adapter->rx_rings[0].xdp_prog);
+	rebuild.refs = atomic64_read(&rebuild.watch->aux->refcnt);
+}
+
+static struct setup_ctx *setup_running(struct kunit *test)
+{
+	struct setup_ctx *c = test->priv;
+
+	memset(&rebuild, 0, sizeof(rebuild));
+	c->adapter->state = __IAVF_RUNNING;
+	rebuild.watch = c->prog;
+	kunit_activate_static_stub(test, iavf_xdp_rebuild, fake_rebuild);
+	return c;
+}
+
+static void setup_running_attach_rebuilds_test(struct kunit *test)
+{
+	struct setup_ctx *c = setup_running(test);
+
+	KUNIT_ASSERT_EQ(test, iavf_xdp_setup(c->adapter, c->prog, NULL), 0);
+	KUNIT_EXPECT_EQ(test, rebuild.calls, 1);
+	KUNIT_EXPECT_FALSE(test, rebuild.locked);
+	/* Committed before the rebuild so the new rings pick it up; the old
+	 * rings never see it.
+	 */
+	KUNIT_EXPECT_PTR_EQ(test, rebuild.prog, c->prog);
+	KUNIT_EXPECT_NULL(test, rebuild.ring_prog);
+}
+
+static void setup_running_detach_rebuilds_test(struct kunit *test)
+{
+	struct setup_ctx *c = setup_running(test);
+	s64 refs = atomic64_read(&c->prog->aux->refcnt);
+
+	KUNIT_ASSERT_EQ(test, iavf_xdp_setup(c->adapter, c->prog, NULL), 0);
+	rcu_assign_pointer(c->adapter->rx_rings[0].xdp_prog, c->prog);
+	KUNIT_ASSERT_EQ(test, iavf_xdp_setup(c->adapter, NULL, NULL), 0);
+	KUNIT_EXPECT_EQ(test, rebuild.calls, 2);
+	KUNIT_EXPECT_FALSE(test, rebuild.locked);
+	/* Rings drop the program before the rebuild, the reference only
+	 * after it.
+	 */
+	KUNIT_EXPECT_NULL(test, rebuild.prog);
+	KUNIT_EXPECT_NULL(test, rebuild.ring_prog);
+	KUNIT_EXPECT_EQ(test, rebuild.refs, refs);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&c->prog->aux->refcnt), refs - 1);
+}
+
+static void setup_running_swap_no_rebuild_test(struct kunit *test)
+{
+	struct setup_ctx *c = setup_running(test);
+	struct bpf_prog *other = kunit_kzalloc(test, sizeof(*other), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, other);
+	other->aux = c->prog->aux;
+	KUNIT_ASSERT_EQ(test, iavf_xdp_setup(c->adapter, c->prog, NULL), 0);
+	KUNIT_ASSERT_EQ(test, iavf_xdp_setup(c->adapter, other, NULL), 0);
+	KUNIT_EXPECT_EQ(test, rebuild.calls, 1);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(c->adapter->rx_rings[1].xdp_prog),
+			    other);
+}
+
+/* Not running: the next open/reset builds the rings with the program */
+static void setup_not_running_no_rebuild_test(struct kunit *test)
+{
+	static const enum iavf_state_t states[] = {
+		__IAVF_DOWN, __IAVF_DOWN_PENDING, __IAVF_COMM_FAILED,
+		__IAVF_RESETTING, __IAVF_INIT_CONFIG_ADAPTER,
+	};
+	struct setup_ctx *c = setup_running(test);
+
+	for (int i = 0; i < ARRAY_SIZE(states); i++) {
+		c->adapter->state = states[i];
+		bpf_prog_inc(c->prog);	/* each attach consumes one, like netvsc */
+		KUNIT_ASSERT_EQ(test, iavf_xdp_setup(c->adapter, c->prog, NULL), 0);
+		KUNIT_ASSERT_EQ(test, iavf_xdp_setup(c->adapter, NULL, NULL), 0);
+	}
+	KUNIT_EXPECT_EQ(test, rebuild.calls, 0);
+}
+
+/* Never close/open from inside our own register_netdevice() */
+static void setup_registering_never_rebuilds_test(struct kunit *test)
+{
+	struct setup_ctx *c = setup_running(test);
+	struct iavf_adapter *a = c->adapter;
+
+	mutex_lock(&a->crit_lock);
+	WRITE_ONCE(a->register_task, current);
+	KUNIT_EXPECT_EQ(test, iavf_xdp_setup(a, c->prog, NULL), 0);
+	KUNIT_EXPECT_EQ(test, iavf_xdp_setup(a, NULL, NULL), 0);
+	WRITE_ONCE(a->register_task, NULL);
+	KUNIT_EXPECT_TRUE(test, mutex_is_locked(&a->crit_lock));
+	mutex_unlock(&a->crit_lock);
+	KUNIT_EXPECT_EQ(test, rebuild.calls, 0);
+}
+
 static struct kunit_case iavf_setup_test_cases[] = {
+	KUNIT_CASE(setup_running_attach_rebuilds_test),
+	KUNIT_CASE(setup_running_detach_rebuilds_test),
+	KUNIT_CASE(setup_running_swap_no_rebuild_test),
+	KUNIT_CASE(setup_not_running_no_rebuild_test),
+	KUNIT_CASE(setup_registering_never_rebuilds_test),
 	KUNIT_CASE(setup_release_drops_reference_test),
 	KUNIT_CASE(setup_release_noop_when_detached_test),
 	KUNIT_CASE(setup_release_without_rings_test),

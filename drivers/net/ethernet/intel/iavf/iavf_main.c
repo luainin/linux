@@ -4,6 +4,7 @@
 #include <linux/net/intel/libie/rx.h>
 #include <linux/netlink.h>
 
+#include <kunit/static_stub.h>
 #include <kunit/visibility.h>
 
 #include "iavf.h"
@@ -4931,6 +4932,76 @@ static netdev_features_t iavf_fix_features(struct net_device *netdev,
 }
 
 /**
+ * iavf_xdp_rebuild - rebuild the queues so a NULL<->prog change takes effect
+ * @adapter: board private structure
+ *
+ * Called with rtnl_lock held and crit_lock not held. Same sequence as an
+ * administrative down/up (like ixgbevf/igb/igc): DISABLE_QUEUES, free the
+ * rings, then rebuild them and CONFIG_VSI_QUEUES/ENABLE_QUEUES. No
+ * VIRTCHNL_OP_RESET_VF is sent, so the PF only sees routine requests.
+ *
+ * The rings can only be freed once the PF has confirmed the queues are
+ * disabled. If it doesn't in time, fall back to a VF reset, which stops the
+ * queues and frees the rings without that confirmation, then reopen.
+ */
+VISIBLE_IF_KUNIT void iavf_xdp_rebuild(struct iavf_adapter *adapter)
+{
+	struct net_device *netdev = adapter->netdev;
+	unsigned long end;
+	int err;
+
+	KUNIT_STATIC_STUB_REDIRECT(iavf_xdp_rebuild, adapter);
+
+	iavf_close(netdev);
+
+	wait_event_timeout(adapter->down_waitqueue,
+			   adapter->state != __IAVF_DOWN_PENDING,
+			   IAVF_XDP_DOWN_TIMEOUT);
+	if (adapter->state == __IAVF_DOWN_PENDING) {
+		netdev_warn(netdev,
+			    "XDP: queues not disabled by the PF, resetting the VF\n");
+		mutex_lock(&adapter->crit_lock);
+		iavf_schedule_reset(adapter, IAVF_FLAG_RESET_NEEDED);
+		mutex_unlock(&adapter->crit_lock);
+
+		/* Poll rather than iavf_wait_for_reset(): that returns early on
+		 * a pending signal, and reset_task's failure paths never wake
+		 * reset_waitqueue.
+		 */
+		end = jiffies + IAVF_XDP_RESET_TIMEOUT;
+		while (iavf_is_reset_in_progress(adapter) &&
+		       time_before(jiffies, end))
+			msleep(20);
+	}
+
+	/* Anything but DOWN means a reset or PF failure took over; whatever
+	 * brings the VF back up rebuilds the rings with the program.
+	 */
+	if (adapter->state != __IAVF_DOWN) {
+		netdev_err(netdev,
+			   "XDP: VF not down (state %d), bring it down and up to recover\n",
+			   adapter->state);
+		return;
+	}
+
+	err = iavf_open(netdev);
+	if (err) {
+		netdev_err(netdev,
+			   "XDP: failed to reopen the VF (%d), bring it down and up to recover\n",
+			   err);
+		return;
+	}
+
+	/* iavf_down() unsynced the address lists; the core only resyncs
+	 * them on a real dev_open().
+	 */
+	netif_addr_lock_bh(netdev);
+	iavf_set_rx_mode(netdev);
+	netif_addr_unlock_bh(netdev);
+}
+EXPORT_SYMBOL_IF_KUNIT(iavf_xdp_rebuild);
+
+/**
  * iavf_xdp_setup - enable/disable/swap the XDP program on all Rx rings
  * @adapter: board private structure
  * @prog: new program (NULL to detach)
@@ -4938,9 +5009,14 @@ static netdev_features_t iavf_fix_features(struct net_device *netdev,
  *
  * NULL<->prog transitions change the Rx buffer headroom and the
  * rxq.max_pkt_size clamp applied in iavf_configure_queues(), both of which
- * only take effect once the rings are torn down and rebuilt, so those go
- * through a full reset (like i40e_xdp_setup()). A prog-to-prog replacement
- * changes neither and is a plain pointer swap.
+ * only take effect once the rings are torn down and rebuilt, see
+ * iavf_xdp_rebuild(). A prog-to-prog replacement changes neither and is a
+ * plain pointer swap.
+ *
+ * Rings are only ever built in iavf_open() and iavf_reset_task(), both of
+ * which pick up adapter->xdp_prog, right before the state becomes
+ * __IAVF_RUNNING. So a rebuild is only needed if the VF is running now; in
+ * any other state the next transition to running applies the program.
  *
  * adapter->rx_rings / adapter->num_active_queues are also mutated by
  * iavf_reset_task()/iavf_watchdog_task(), which run on a workqueue without
@@ -4954,8 +5030,8 @@ VISIBLE_IF_KUNIT int iavf_xdp_setup(struct iavf_adapter *adapter,
 				    struct netlink_ext_ack *extack)
 {
 	struct bpf_prog *old_prog;
-	bool need_reset, locked, reset;
-	int i, ret;
+	bool need_reset, locked, rebuild;
+	int i;
 
 	if (prog && !iavf_xdp_mtu_ok(adapter->netdev->mtu)) {
 		NL_SET_ERR_MSG_MOD(extack,
@@ -5008,29 +5084,17 @@ VISIBLE_IF_KUNIT int iavf_xdp_setup(struct iavf_adapter *adapter,
 		for (i = 0; i < adapter->num_active_queues; i++)
 			rcu_assign_pointer(adapter->rx_rings[i].xdp_prog, prog);
 
-	/* adapter->flags is also modified by reset_task under crit_lock, so
-	 * request the reset before dropping it.
-	 */
-	reset = need_reset && netif_running(adapter->netdev);
-	if (reset)
-		iavf_schedule_reset(adapter, IAVF_FLAG_RESET_NEEDED);
+	rebuild = need_reset && !locked && adapter->state == __IAVF_RUNNING;
 
 	if (!locked)
 		mutex_unlock(&adapter->crit_lock);
 
-	if (reset) {
-		/* The program is already committed to the adapter and the
-		 * reset keeps running in the background, so a slow reset (a VF
-		 * without link can take longer than the wait) is not a failure.
-		 * Failing here would leave hv_netvsc believing the VF has no
-		 * program while it does.
-		 */
-		ret = iavf_wait_for_reset(adapter);
-		if (ret)
-			netdev_warn(adapter->netdev,
-				    "XDP %s: reset still in progress, completing in background\n",
-				    prog ? "attach" : "detach");
-	}
+	/* The program is already committed to the adapter, so a failed
+	 * rebuild is logged, not returned: failing would leave hv_netvsc
+	 * believing the VF has no program while it does.
+	 */
+	if (rebuild)
+		iavf_xdp_rebuild(adapter);
 
 	if (old_prog)
 		bpf_prog_put(old_prog);
