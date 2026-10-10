@@ -140,6 +140,35 @@ else
 	skip "MTU guard (driver is ${DRIVER:-unknown}, not iavf)"
 fi
 
+# 4b. ethtool -S layout, VF state after a rebuild, xdp_drops (iavf only)
+if [ "$DRIVER" = iavf ]; then
+	stats=$(ethtool -S "$IFACE" | sed -n 's/^ *\([^:]*\):.*/\1/p')
+	nrx=$(echo "$stats" | grep -c '^rx-[0-9]*\.packets$')
+	nxdp=$(echo "$stats" | grep -c '^rx-[0-9]*\.xdp_drops$')
+	first_xdp=$(echo "$stats" | grep -n '\.xdp_drops$' | head -1 | cut -d: -f1)
+	last_stock=$(echo "$stats" | grep -n '^[rt]x-[0-9]*\.bytes$' | tail -1 | cut -d: -f1)
+	[ "$nrx" -gt 0 ] && [ "$nxdp" = "$nrx" ] && ok "one rx-N.xdp_drops per Rx queue ($nxdp)" \
+		|| bad "rx-N.xdp_drops count $nxdp, Rx queues $nrx"
+	check_not "no tx-N.xdp_drops" sh -c "ethtool -S $IFACE | grep -q 'tx-[0-9]*\.xdp_drops:'"
+	[ -n "$first_xdp" ] && [ "$first_xdp" -gt "${last_stock:-0}" ] \
+		&& ok "xdp_drops listed after all stock stats" || bad "xdp_drops inside the stock stats"
+
+	vf_up() { ip -o link show dev "$IFACE" | grep -q '[<,]UP[,>]' &&
+		  [ "$(cat /sys/class/net/$IFACE/operstate)" != down ]; }
+	ip link set dev "$IFACE" up
+	attach pass; sleep 1; check "VF up after attach (rebuild reopened it)" vf_up
+	detach; sleep 1;      check "VF up after detach (rebuild reopened it)" vf_up
+
+	if [ -n "$PEER_IP" ]; then
+		xdp_drops() { ethtool -S "$IFACE" | awk '/rx-[0-9]+\.xdp_drops:/{s+=$2} END{print s+0}'; }
+		attach drop; before=$(xdp_drops)
+		pingp >/dev/null 2>&1
+		after=$(xdp_drops); detach
+		[ "$after" -ge $((before + 3)) ] && ok "xdp_drops counts dropped frames (+$((after - before)))" \
+			|| bad "xdp_drops did not count drops ($before -> $after)"
+	fi
+fi
+
 # 5. kernel health
 if [ -w /sys/kernel/debug/kmemleak ]; then
 	echo scan > /sys/kernel/debug/kmemleak; sleep 5; echo scan > /sys/kernel/debug/kmemleak
