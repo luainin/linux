@@ -4954,7 +4954,7 @@ VISIBLE_IF_KUNIT int iavf_xdp_setup(struct iavf_adapter *adapter,
 				    struct netlink_ext_ack *extack)
 {
 	struct bpf_prog *old_prog;
-	bool need_reset, locked;
+	bool need_reset, locked, reset;
 	int i, ret;
 
 	if (prog && !iavf_xdp_mtu_ok(adapter->netdev->mtu)) {
@@ -4994,11 +4994,17 @@ VISIBLE_IF_KUNIT int iavf_xdp_setup(struct iavf_adapter *adapter,
 		for (i = 0; i < adapter->num_active_queues; i++)
 			rcu_assign_pointer(adapter->rx_rings[i].xdp_prog, prog);
 
+	/* adapter->flags is also modified by reset_task under crit_lock, so
+	 * request the reset before dropping it.
+	 */
+	reset = need_reset && netif_running(adapter->netdev);
+	if (reset)
+		iavf_schedule_reset(adapter, IAVF_FLAG_RESET_NEEDED);
+
 	if (!locked)
 		mutex_unlock(&adapter->crit_lock);
 
-	if (need_reset && netif_running(adapter->netdev)) {
-		iavf_schedule_reset(adapter, IAVF_FLAG_RESET_NEEDED);
+	if (reset) {
 		/* The program is already committed to the adapter and the
 		 * reset keeps running in the background, so a slow reset (a VF
 		 * without link can take longer than the wait) is not a failure.
